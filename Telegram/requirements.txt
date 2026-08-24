@@ -1,0 +1,7 @@
+aiogram==2.25.1
+telethon==1.27.0
+pyyaml
+aioschedule
+requests
+qrcode
+pillow

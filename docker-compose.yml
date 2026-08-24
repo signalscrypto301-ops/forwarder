@@ -1,0 +1,25 @@
+networks:
+  app-network:
+    driver: bridge
+services:
+  whatsapp-bot:
+    build: ./Whatsapp
+    shm_size: 1gb
+    ports:
+      - "5426:5426"
+    volumes:
+      - ./Whatsapp/.wwebjs_auth:/app/.wwebjs_auth
+      - ./Whatsapp/uploads:/app/uploads
+    restart: unless-stopped
+    networks:
+      - app-network
+  telegram-bot:
+    build: ./Telegram
+    volumes:
+      - ./Telegram:/app
+    restart: unless-stopped
+    depends_on:
+      - whatsapp-bot
+    command: sh -c "python bot.py"
+    networks:
+      - app-network

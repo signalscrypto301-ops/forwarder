@@ -1,0 +1,9 @@
+*.log
+*.log.*
+__pycache__
+myenv
+config.yml
+database.db
+config copy.yml
+*.session
+*.session-journal

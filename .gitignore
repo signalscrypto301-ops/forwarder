@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+*.log
+*.log.*
+.DS_Store
+Telegram/media/
+Telegram/*.jpg
+Telegram/*.png
+Whatsapp/uploads/

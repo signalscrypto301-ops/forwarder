@@ -1,0 +1,258 @@
+import { Client, LocalAuth, MessageMedia } from "whatsapp-web.js";
+import express from "express";
+import bodyParser from "body-parser";
+import "dotenv/config";
+import fs from "fs";
+import axios from "axios";
+import multer from "multer";
+import path from "path";
+
+const app = express();
+const clientId: string = process.env.CLIENT_ID || "";
+app.use(bodyParser.json());
+const sessions: Record<string, Client> = {};
+let isListening = false;
+
+// Setup multer for media upload
+const storage = multer.diskStorage({
+    destination: "uploads/",
+    filename: (req, file, cb) => {
+        cb(null, Date.now() + "-" + file.originalname);
+    },
+});
+const upload = multer({ storage });
+
+// ---------- Session Management with Reconnect Logic ----------
+
+function createOrRestartSession(clientId: string) {
+    const client = new Client({
+        authStrategy: new LocalAuth({ clientId }),
+        puppeteer: {
+            args: ["--no-sandbox", "--disable-setuid-sandbox"],
+            executablePath: process.env.CHROME_PATH
+        },
+    });
+
+    client.on("ready", () => {
+        console.log(`✅ Client ${clientId} is ready`);
+    });
+
+    client.on("disconnected", (reason) => {
+        console.warn(`⚠️ Client ${clientId} disconnected: ${reason}`);
+        delete sessions[clientId];
+        setTimeout(() => {
+            console.log(`🔁 Reinitializing client ${clientId}...`);
+            createOrRestartSession(clientId);
+        }, 3000);
+    });
+
+    client.on("auth_failure", (msg) => {
+        console.error(`❌ Auth failure for ${clientId}:`, msg);
+        const authPath = path.join(".wwebjs_auth", `session-${clientId}`);
+        if (fs.existsSync(authPath)) {
+            fs.rmSync(authPath, { recursive: true, force: true });
+        }
+        delete sessions[clientId];
+    });
+
+    client.on("qr", (qr) => {
+        console.log(`📲 QR generated for ${clientId}`);
+    });
+
+    client.initialize();
+    sessions[clientId] = client;
+}
+
+function startSession(clientId: string) {
+    createOrRestartSession(clientId);
+}
+
+// ---------- Express Routes ----------
+
+app.post("/createsession", (req, res) => {
+
+    console.log("Creating session for clientId:", req.body.clientId);
+    const { clientId } = req.body;
+
+    if (sessions[clientId] && sessions[clientId].info) {
+        return res.status(400).json({ message: "Session already exists" });
+    }
+
+    createOrRestartSession(clientId);
+
+    const qrEventListener = (qr: string) => {
+        res.json({ qrcode: qr });
+        sessions[clientId].removeListener("qr", qrEventListener);
+    };
+
+    sessions[clientId].on("qr", qrEventListener);
+});
+
+app.post("/startlistening", async (req, res) => {
+    const { clientId } = req.body;
+
+    if (!(sessions[clientId] && sessions[clientId].info)) {
+        return res.status(400).json({ message: "Session is not authorized" });
+    }
+
+    if (isListening) {
+        return res.json({ message: "Already listening to messages." });
+    }
+
+    isListening = true;
+    const client = sessions[clientId];
+
+    try {
+        client.on("message", async (msg) => {
+            console.log("📩 message received", msg.body);
+        });
+        res.json({ message: "Listening to messages" });
+    } catch (error) {
+        console.error("Error starting to listen:", error);
+        res.status(500).json({ message: "Failed to start listening" });
+    }
+});
+
+app.post("/getChatId", async (req, res) => {
+    const { clientId, chatName } = req.body;
+    if (!(sessions[clientId] && sessions[clientId].info)) {
+        return res.status(400).json({ message: "Session is not authorized" });
+    }
+
+    try {
+        // const chats = await sessions[clientId].getChats();
+        const channels = await sessions[clientId].getChannels();
+        const channel = channels.find((chat) => chat.name === chatName);
+        if (channel) {
+            return res.json({ groupId: channel.id._serialized });
+        } else {
+            return res.status(404).json({ message: "Group not found" });
+        }
+    } catch (error) {
+        console.error("Error in getChatId:", error);
+        res.status(500).json({ message: "Internal server error" });
+    }
+});
+
+app.post("/sendToGroup", upload.single("media"), async (req, res) => {
+    const { clientId, groupId, caption } = req.body;
+    const file = req.file;
+
+    if (!(sessions[clientId] && sessions[clientId].info)) {
+        return res.status(400).json({ message: "Session is not authorized" });
+    }
+
+    const client = sessions[clientId];
+    try {
+        if (file) {
+            const media = MessageMedia.fromFilePath(file.path);
+            await client.sendMessage(groupId, media, { caption });
+            fs.unlinkSync(file.path);
+        } else if (caption) {
+            await client.sendMessage(groupId, caption);
+        } else {
+            return res.status(400).json({ message: "No media or caption provided" });
+        }
+
+        res.json({ message: "Message sent successfully" });
+    } catch (error) {
+        console.error("Error sending message:", error);
+        res.status(500).json({ message: "Failed to send message" });
+    }
+});
+
+app.post("/sendText", async (req, res) => {
+    const { clientId, groupId, text } = req.body;
+
+    if (!(sessions[clientId] && sessions[clientId].info)) {
+        return res.status(400).json({ message: "Session is not authorized" });
+    }
+
+    try {
+        await sessions[clientId].sendMessage(groupId, text);
+        res.json({ message: "Text message sent successfully" });
+    } catch (error) {
+        console.error("Error sending text message:", error);
+        res.status(500).json({ message: "Failed to send text message" });
+    }
+});
+
+app.post("/sendMedia", upload.single("media"), async (req, res) => {
+    const { clientId, groupId, caption } = req.body;
+    const file = req.file;
+
+    if (!(sessions[clientId] && sessions[clientId].info)) {
+        return res.status(400).json({ message: "Session is not authorized" });
+    }
+
+    if (!file) {
+        return res.status(400).json({ message: "No media file provided" });
+    }
+
+    try {
+        const media = MessageMedia.fromFilePath(file.path);
+        await sessions[clientId].sendMessage(groupId, media, { caption });
+        res.json({ message: "Media message sent successfully" });
+    } catch (error) {
+        console.error("Error sending media message:", error);
+        res.status(500).json({ message: "Failed to send media message" });
+    }
+    // if file path exists, delete it after sending
+    if (file && fs.existsSync(file.path)) {
+        fs.unlinkSync(file.path);
+    }
+});
+
+app.post("/logout", async (req, res) => {
+    const { clientId } = req.body;
+
+    if (!(sessions[clientId] && sessions[clientId].info)) {
+        const authPath = path.join(".wwebjs_auth", `session-${clientId}`);
+        if (fs.existsSync(authPath)) {
+            fs.rmSync(authPath, { recursive: true, force: true });
+        }
+        return res.status(400).json({ message: "Session not found, cleaned up files." });
+    }
+
+    try {
+        await sessions[clientId].logout();
+        const authPath = path.join(".wwebjs_auth", `session-${clientId}`);
+        if (fs.existsSync(authPath)) {
+            fs.rmSync(authPath, { recursive: true, force: true });
+        }
+        delete sessions[clientId];
+        res.json({ message: "Logged out successfully" });
+    } catch (error) {
+        console.error("Logout error:", error);
+        res.status(500).json({ message: "Logout failed" });
+    }
+});
+
+// ---------- Session Bootstrap on Restart ----------
+
+if (!fs.existsSync(".wwebjs_auth")) {
+    fs.mkdirSync(".wwebjs_auth");
+}
+
+function initializeAllSessions() {
+    const sessionFolder = ".wwebjs_auth";
+    setTimeout(() => {
+        try {
+            const folderContents = fs.readdirSync(sessionFolder);
+            for (const folderName of folderContents) {
+                if (folderName.startsWith("session-")) {
+                    const clientId = folderName.replace("session-", "");
+                    startSession(clientId);
+                }
+            }
+        } catch (error) {
+            console.error("Error initializing sessions:", error);
+        }
+    }, 1000);
+}
+
+initializeAllSessions();
+
+app.listen(process.env.PORT || 3000, () => {
+    console.log("🚀 Server is ready!");
+});
