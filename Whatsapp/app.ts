@@ -220,6 +220,9 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
         const client = sessions[targetId];
         if (file) {
             const media = MessageMedia.fromFilePath(file.path);
+            if (file.originalname) {
+                media.filename = file.originalname;
+            }
             await client.sendMessage(groupId, media, { caption });
         } else if (caption) {
             await client.sendMessage(groupId, caption);
@@ -276,6 +279,9 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
         }
 
         const media = MessageMedia.fromFilePath(file.path);
+        if (file.originalname) {
+            media.filename = file.originalname;
+        }
         await sessions[targetId].sendMessage(groupId, media, { caption });
         res.json({ message: "Media message sent successfully" });
     } catch (error) {
