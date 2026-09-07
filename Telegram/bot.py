@@ -36,6 +36,26 @@ bot_client = TelegramClient("bot_client", config.API_ID, config.API_HASH).start(
 # Concurrency limiter to protect WhatsApp Web and network resources
 UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
 
+# Debounced alert timestamp to prevent admin notification spam
+last_auth_alert_time = 0.0
+
+
+async def notify_admins_auth_required():
+    """Alert admins when WhatsApp session drops or needs QR login (throttled to once every 5 mins)."""
+    global last_auth_alert_time
+    now = datetime.now().timestamp()
+    if now - last_auth_alert_time > 300:
+        last_auth_alert_time = now
+        for admin_id in config.admin_ids:
+            try:
+                await bot.send_message(
+                    admin_id,
+                    "?? <b>WhatsApp Session Error</b>: The WhatsApp Web session is unauthorized or disconnected. Please send /login to re-authenticate.",
+                    parse_mode=ParseMode.HTML,
+                )
+            except Exception as e:
+                logger.error(f"Failed to alert admin {admin_id} about auth: {e}")
+
 
 def generate_qr_code(qr_data: str) -> str:
     qr = qrcode.QRCode(
@@ -319,10 +339,14 @@ async def view_channels_command(message: Message):
 
 
 def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> str:
+    """
+    Translates Telegram MessageEntity offset formatting to WhatsApp markdown.
+    Uses UTF-16 code units to preserve emoji and surrogate pair indexing.
+    Uses LIFO (Last-In, First-Out) suffix insertion to ensure symmetric nesting.
+    """
     if not caption or not entities:
         return caption or ""
 
-    # Convert caption to UTF-16 to match Telegram's entity offset logic
     utf16_text = caption.encode("utf-16-le")
     code_units = []
     i = 0
@@ -331,7 +355,6 @@ def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> 
         code_units.append(unit)
         i += 2
 
-    # Map from UTF-16 unit index to Python string index
     utf16_to_str_idx = {}
     str_idx = 0
     utf16_idx = 0
@@ -370,7 +393,8 @@ def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> 
         if start is not None and prefix:
             prefix_insertions.setdefault(start, []).append(prefix)
         if end is not None and suffix:
-            suffix_insertions.setdefault(end, []).append(suffix)
+            # LIFO order: insert at index 0 so inner tags close before outer tags
+            suffix_insertions.setdefault(end, []).insert(0, suffix)
 
     result = []
     for i, ch in enumerate(caption):
@@ -417,6 +441,8 @@ async def send_to_single_group(group: str, downloaded_media: str | None, caption
                         else response.text
                     )
                     logger.error(f"Failed to send media message to group {group}: {msg}")
+                    if "Session is not authorized" in str(msg):
+                        await notify_admins_auth_required()
             except Exception as e:
                 logger.error(f"Error sending media message to group {group}: {e}")
         else:
@@ -439,6 +465,8 @@ async def send_to_single_group(group: str, downloaded_media: str | None, caption
                         else response.text
                     )
                     logger.error(f"Failed to send text message to group {group}: {msg}")
+                    if "Session is not authorized" in str(msg):
+                        await notify_admins_auth_required()
             except Exception as e:
                 logger.error(f"Error sending text message to group {group}: {e}")
 
@@ -487,9 +515,21 @@ async def handle_channel_post(message: types.Message):
                 await video_message.download_media(file=video_file_path)
 
                 if os.path.exists(video_file_path) and os.path.getsize(video_file_path) > 0:
-                    if os.path.getsize(video_file_path) > 100 * 1024 * 1024:
+                    file_size = os.path.getsize(video_file_path)
+                    if file_size > 100 * 1024 * 1024:
                         os.remove(video_file_path)
-                        logger.info("Video size exceeds 100 MB limit.")
+                        logger.warning(
+                            f"Video in channel {channel_id} ({file_size / (1024*1024):.1f} MB) exceeds 100 MB limit."
+                        )
+                        for admin_id in config.admin_ids:
+                            try:
+                                await bot.send_message(
+                                    admin_id,
+                                    f"?? <b>Video Skipped</b>: A video in channel <code>{channel_id}</code> ({file_size / (1024*1024):.1f} MB) exceeded the 100 MB limit and was not forwarded.",
+                                    parse_mode=ParseMode.HTML,
+                                )
+                            except Exception:
+                                pass
                         return
                     downloaded_media = video_file_path
                 else:
