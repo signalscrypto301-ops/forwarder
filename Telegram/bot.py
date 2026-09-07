@@ -4,6 +4,7 @@ import shutil
 import asyncio
 import random
 import time
+import io
 from datetime import datetime, timedelta
 
 try:
@@ -63,8 +64,16 @@ from database import (
     update_channel_last_post,
     get_channel_last_post,
     get_stale_channels,
+    record_channel_post_activity,
+    get_top_active_channels,
+    get_hourly_traffic_distribution,
+    get_channel_volume_summary,
 )
 from rate_limiter import DeliveryRateController
+from analytics_card import (
+    generate_analytics_infographic,
+    generate_analytics_text_report,
+)
 
 bot = aiogram.Bot(config.bot_token)
 dp = aiogram.Dispatcher(bot)
@@ -282,6 +291,7 @@ async def help_command(message: Message):
     help_text = (
         "🤖 <b>Forwarder Admin Commands</b>:\n\n"
         "📊 /status - Live health dashboard & channel statistics\n"
+        "📈 /analytics - Visual audience intelligence, top channels & traffic heatmap\n"
         "🖥️ /telemetry - Real-time server and container resource metrics\n"
         "📈 /report [YYYY-MM-DD] - Daily delivery report & performance summary\n"
         "📬 /failed - Dead-Letter Queue (DLQ) inspector & retry manager\n"
@@ -686,6 +696,260 @@ async def stale_channels_command(message: Message):
 
     digest = generate_stale_channels_digest(stale, threshold_hours=threshold)
     await message.reply(digest, parse_mode=ParseMode.HTML)
+
+
+# ---------- Audience & Channel Intelligence (Optimization 6.A) ----------
+
+AUDIENCE_CACHE: dict = {"timestamp": 0.0, "data": None}
+AUDIENCE_CACHE_LOCK = asyncio.Lock()
+
+
+async def fetch_audience_metadata(force_refresh: bool = False) -> dict:
+    """
+    Fetches aggregate audience statistics (groups, newsletters, subscribers)
+    from the Baileys WhatsApp microservice. Cached for 15 minutes to reduce socket queries.
+    """
+    global AUDIENCE_CACHE
+    now = time.time()
+    if (
+        not force_refresh
+        and AUDIENCE_CACHE["data"] is not None
+        and (now - AUDIENCE_CACHE["timestamp"]) < 900
+    ):
+        return AUDIENCE_CACHE["data"]
+
+    async with AUDIENCE_CACHE_LOCK:
+        if (
+            not force_refresh
+            and AUDIENCE_CACHE["data"] is not None
+            and (now - AUDIENCE_CACHE["timestamp"]) < 900
+        ):
+            return AUDIENCE_CACHE["data"]
+
+        session = await get_http_session()
+        data = None
+        if session:
+            try:
+                url = f"{config.whatsapp_service}/audience-stats"
+                async with session.get(url, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+            except Exception as e:
+                logger.warning(f"Failed to fetch /audience-stats from WhatsApp service: {e}")
+
+        # Fallback if /audience-stats is unavailable: compute from /groups
+        if not data or not isinstance(data, dict) or "totalAudience" not in data:
+            try:
+                url = f"{config.whatsapp_service}/groups"
+                if session:
+                    async with session.get(url, timeout=10) as resp:
+                        if resp.status == 200:
+                            res_json = await resp.json()
+                            chats = res_json.get("chats", [])
+                            groups_count = sum(1 for c in chats if c.get("type") == "group")
+                            nl_count = sum(1 for c in chats if c.get("type") == "newsletter")
+                            grp_members = sum(c.get("participantsCount", 0) for c in chats if c.get("type") == "group")
+                            nl_subs = sum(c.get("participantsCount", 0) for c in chats if c.get("type") == "newsletter")
+                            data = {
+                                "totalAudience": grp_members + nl_subs,
+                                "groupsCount": groups_count,
+                                "groupMembers": grp_members,
+                                "newslettersCount": nl_count,
+                                "newsletterSubscribers": nl_subs,
+                                "destinations": [
+                                    {
+                                        "id": c.get("id"),
+                                        "name": c.get("name"),
+                                        "type": c.get("type"),
+                                        "count": c.get("participantsCount", 0),
+                                    }
+                                    for c in chats
+                                ],
+                            }
+            except Exception as e:
+                logger.warning(f"Failed to fetch /groups fallback: {e}")
+
+        if not data:
+            data = {
+                "totalAudience": 0,
+                "groupsCount": 0,
+                "groupMembers": 0,
+                "newslettersCount": 0,
+                "newsletterSubscribers": 0,
+                "destinations": [],
+            }
+
+        AUDIENCE_CACHE = {"timestamp": now, "data": data}
+        return data
+
+
+def build_analytics_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("🔄 Refresh", callback_data="cb:ana:ref"),
+        InlineKeyboardButton("📢 Top Channels", callback_data="cb:ana:top"),
+    )
+    kb.row(
+        InlineKeyboardButton("👥 Audience Breakdown", callback_data="cb:ana:aud"),
+        InlineKeyboardButton("📱 Channels Menu", callback_data="p:1"),
+    )
+    return kb
+
+
+def build_analytics_detail_keyboard() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(row_width=1)
+    kb.add(InlineKeyboardButton("🔙 Back to Analytics Overview", callback_data="cb:ana:main"))
+    return kb
+
+
+@dp.message_handler(commands=["analytics", "audience", "traffic"])
+async def analytics_command(message: Message):
+    if not message.chat.type == "private" or not is_admin(message.from_user.id):
+        return
+
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    top_channels = await asyncio.to_thread(get_top_active_channels, today_str, 5)
+    hourly_dist = await asyncio.to_thread(get_hourly_traffic_distribution, today_str)
+    summary = await asyncio.to_thread(get_channel_volume_summary, today_str)
+    audience_stats = await fetch_audience_metadata()
+
+    kb = build_analytics_keyboard()
+
+    img_bytes = generate_analytics_infographic(
+        today_str,
+        top_channels,
+        hourly_dist,
+        audience_stats,
+        summary,
+    )
+
+    caption = (
+        f"📊 <b>Audience &amp; Channel Intelligence ({today_str})</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>Total Audience:</b> <b>{audience_stats.get('totalAudience', 0):,}</b> "
+        f"({audience_stats.get('groupsCount', 0)} groups, {audience_stats.get('newslettersCount', 0)} newsletters)\n"
+        f"📈 <b>Posts Forwarded:</b> <b>{summary.get('total_posts', 0)}</b> across <b>{summary.get('active_channels', 0)}</b> channels\n"
+        f"🔥 <b>Peak Traffic Window:</b> <b>{summary.get('peak_hour_label', 'N/A')}</b> ({summary.get('peak_hour_volume', 0)} posts)\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💡 <i>Tap 'Top Channels' or 'Audience Breakdown' below for details.</i>"
+    )
+
+    if img_bytes:
+        photo = io.BytesIO(img_bytes)
+        photo.name = f"analytics_{today_str}.png"
+        try:
+            await message.reply_photo(photo, caption=caption, reply_markup=kb, parse_mode=ParseMode.HTML)
+            return
+        except Exception as e:
+            logger.warning(f"Failed to send analytics photo: {e}, falling back to text.")
+
+    text_report = generate_analytics_text_report(top_channels, hourly_dist, audience_stats, summary)
+    await message.reply(text_report, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cb:ana:"))
+async def handle_analytics_callbacks(callback_query: CallbackQuery):
+    if not is_admin(callback_query.from_user.id):
+        await callback_query.answer("Unauthorized.", show_alert=True)
+        return
+
+    action = callback_query.data[7:]
+    today_str = datetime.now().strftime("%Y-%m-%d")
+
+    if action == "ref":
+        await callback_query.answer("Refreshing analytics...", show_alert=False)
+        top_channels = await asyncio.to_thread(get_top_active_channels, today_str, 5)
+        hourly_dist = await asyncio.to_thread(get_hourly_traffic_distribution, today_str)
+        summary = await asyncio.to_thread(get_channel_volume_summary, today_str)
+        audience_stats = await fetch_audience_metadata(force_refresh=True)
+
+        text_report = generate_analytics_text_report(top_channels, hourly_dist, audience_stats, summary)
+        try:
+            await callback_query.message.edit_text(
+                text_report,
+                reply_markup=build_analytics_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback_query.answer("Analytics refreshed! Send /analytics for new infographic.", show_alert=True)
+
+    elif action == "top":
+        await callback_query.answer()
+        top_channels = await asyncio.to_thread(get_top_active_channels, today_str, 15)
+        lines = [
+            "📢 <b>Top Active Channels Breakdown</b>",
+            f"<i>Activity rankings for {today_str}</i>",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if top_channels:
+            for c in top_channels:
+                r = c.get("rank", 1)
+                cid = c.get("channel_id")
+                cnt = c.get("post_count")
+                pct = c.get("percent")
+                grps = c.get("groups_count", 0)
+                lines.append(f"<code>{r}.</code> <code>{cid}</code>: <b>{cnt}</b> posts (<code>{pct}%</code>) • {grps} groups")
+        else:
+            lines.append("<i>No channel post activity recorded yet today.</i>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+        try:
+            await callback_query.message.edit_text(
+                "\n".join(lines),
+                reply_markup=build_analytics_detail_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback_query.message.reply("\n".join(lines), reply_markup=build_analytics_detail_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif action == "aud":
+        await callback_query.answer()
+        audience_stats = await fetch_audience_metadata()
+        destinations = audience_stats.get("destinations", [])
+        lines = [
+            "👥 <b>WhatsApp Audience Reach Breakdown</b>",
+            f"Total Reach: <b>{audience_stats.get('totalAudience', 0):,}</b>",
+            f"Newsletters: <b>{audience_stats.get('newsletterSubscribers', 0):,}</b> ({audience_stats.get('newslettersCount', 0)})",
+            f"Groups: <b>{audience_stats.get('groupMembers', 0):,}</b> ({audience_stats.get('groupsCount', 0)})",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+        ]
+        if destinations:
+            for idx, d in enumerate(destinations[:20], 1):
+                icon = "📢" if d.get("type") == "newsletter" else "💬"
+                name = d.get("name") or d.get("id")
+                cnt = d.get("count", 0)
+                lines.append(f"{icon} <b>{name}</b>: <b>{cnt:,}</b>")
+            if len(destinations) > 20:
+                lines.append(f"<i>... and {len(destinations) - 20} more destinations.</i>")
+        else:
+            lines.append("<i>No WhatsApp destination metadata available.</i>")
+        lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+
+        try:
+            await callback_query.message.edit_text(
+                "\n".join(lines),
+                reply_markup=build_analytics_detail_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback_query.message.reply("\n".join(lines), reply_markup=build_analytics_detail_keyboard(), parse_mode=ParseMode.HTML)
+
+    elif action == "main":
+        await callback_query.answer()
+        top_channels = await asyncio.to_thread(get_top_active_channels, today_str, 5)
+        hourly_dist = await asyncio.to_thread(get_hourly_traffic_distribution, today_str)
+        summary = await asyncio.to_thread(get_channel_volume_summary, today_str)
+        audience_stats = await fetch_audience_metadata()
+
+        text_report = generate_analytics_text_report(top_channels, hourly_dist, audience_stats, summary)
+        try:
+            await callback_query.message.edit_text(
+                text_report,
+                reply_markup=build_analytics_keyboard(),
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            await callback_query.message.reply(text_report, reply_markup=build_analytics_keyboard(), parse_mode=ParseMode.HTML)
 
 
 @dp.message_handler(commands=["get_chat_id"])
@@ -2092,6 +2356,9 @@ async def handle_channel_post(message: types.Message):
 
     # Record channel activity timestamp (Optimization 3.B: Stale Channel Detector)
     await asyncio.to_thread(update_channel_last_post, channel_id)
+
+    # Record channel hourly post volume (Optimization 6.A: Audience & Channel Intelligence)
+    await asyncio.to_thread(record_channel_post_activity, channel_id)
 
     # Check if forwarding is paused for this channel (Optimization 4.A)
     if is_channel_paused(channel_id):

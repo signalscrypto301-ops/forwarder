@@ -557,6 +557,70 @@ app.get("/groups", async (req, res) => {
     }
 });
 
+app.get("/audience-stats", async (req, res) => {
+    const targetId = sanitizeClientId((req.query.clientId as string) || clientId);
+    const entry = sessions[targetId];
+    if (!(entry && entry.isReady && entry.sock)) {
+        return res.status(400).json({
+            message: "Session is not authorized",
+            totalAudience: 0,
+            groupsCount: 0,
+            groupMembers: 0,
+            newslettersCount: 0,
+            newsletterSubscribers: 0,
+            destinations: [],
+        });
+    }
+
+    try {
+        const chats = await discoverChats(entry, targetId);
+        let groupsCount = 0;
+        let groupMembers = 0;
+        let newslettersCount = 0;
+        let newsletterSubscribers = 0;
+
+        const destinations = chats.map((c) => {
+            const count = c.participantsCount || 0;
+            if (c.type === "group") {
+                groupsCount++;
+                groupMembers += count;
+            } else if (c.type === "newsletter") {
+                newslettersCount++;
+                newsletterSubscribers += count;
+            }
+            return {
+                id: c.id,
+                name: c.name,
+                type: c.type,
+                count,
+            };
+        });
+
+        destinations.sort((a, b) => b.count - a.count);
+
+        res.json({
+            totalAudience: groupMembers + newsletterSubscribers,
+            groupsCount,
+            groupMembers,
+            newslettersCount,
+            newsletterSubscribers,
+            destinations,
+        });
+    } catch (error: any) {
+        console.error(`[${targetId}] Error computing audience stats:`, error);
+        res.status(500).json({
+            message: "Failed to compute audience stats",
+            error: error?.message || String(error),
+            totalAudience: 0,
+            groupsCount: 0,
+            groupMembers: 0,
+            newslettersCount: 0,
+            newsletterSubscribers: 0,
+            destinations: [],
+        });
+    }
+});
+
 app.post("/getGroups", async (req, res) => {
     const targetId = sanitizeClientId(req.body.clientId || (req.query.clientId as string) || clientId);
     const entry = sessions[targetId];

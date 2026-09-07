@@ -126,6 +126,29 @@ def create_table():
         """
     )
 
+    # Table for per-channel hourly traffic and audience analytics (Optimization 6.A)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS channel_hourly_stats (
+            channel_id TEXT NOT NULL,
+            date_key TEXT NOT NULL,
+            hour_key INTEGER NOT NULL,
+            post_count INTEGER DEFAULT 1,
+            PRIMARY KEY (channel_id, date_key, hour_key)
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_hourly_date ON channel_hourly_stats(date_key)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_hourly_channel ON channel_hourly_stats(channel_id)
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -615,6 +638,172 @@ def get_stale_channels(threshold_hours: int = 72) -> list[dict]:
         )
 
     return stale_list
+
+
+def record_channel_post_activity(channel_id: str, timestamp=None):
+    """
+    Records and increments post volume for a specific channel within its hourly bucket.
+    """
+    from datetime import datetime
+
+    channel_id = clean_id(channel_id)
+    if not channel_id:
+        return
+
+    dt = timestamp or datetime.now()
+    date_key = dt.strftime("%Y-%m-%d")
+    hour_key = dt.hour
+
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO channel_hourly_stats (channel_id, date_key, hour_key, post_count)
+        VALUES (?, ?, ?, 1)
+        ON CONFLICT(channel_id, date_key, hour_key)
+        DO UPDATE SET post_count = post_count + 1
+        """,
+        (channel_id, date_key, hour_key),
+    )
+    connection.commit()
+    connection.close()
+
+
+def get_top_active_channels(date_key: str | None = None, limit: int = 5) -> list[dict]:
+    """
+    Returns top active channels ranked by post count for a given date (defaults to today).
+    Includes channel_id, post_count, percentage of total volume, and mapped groups count.
+    """
+    from datetime import datetime
+
+    target_date = date_key or datetime.now().strftime("%Y-%m-%d")
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        "SELECT COALESCE(SUM(post_count), 0) FROM channel_hourly_stats WHERE date_key = ?",
+        (target_date,),
+    )
+    total_row = cursor.fetchone()
+    total_posts = total_row[0] if total_row else 0
+
+    cursor.execute(
+        """
+        SELECT channel_id, SUM(post_count) as total
+        FROM channel_hourly_stats
+        WHERE date_key = ?
+        GROUP BY channel_id
+        ORDER BY total DESC
+        LIMIT ?
+        """,
+        (target_date, limit),
+    )
+    rows = cursor.fetchall()
+    connection.close()
+
+    result = []
+    for rank, (cid, cnt) in enumerate(rows, 1):
+        pct = round((cnt / total_posts * 100.0), 1) if total_posts > 0 else 0.0
+        groups = get_groups_for_channel(cid)
+        result.append(
+            {
+                "rank": rank,
+                "channel_id": cid,
+                "post_count": cnt,
+                "percent": pct,
+                "groups_count": len(groups),
+            }
+        )
+    return result
+
+
+def get_hourly_traffic_distribution(date_key: str | None = None) -> list[dict]:
+    """
+    Returns hourly post counts for all 24 hours (00:00 to 23:00) for a given date.
+    Returns a list of 24 items: [{"hour": 0, "label": "00:00", "post_count": N, "is_peak": bool}, ...]
+    """
+    from datetime import datetime
+
+    target_date = date_key or datetime.now().strftime("%Y-%m-%d")
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT hour_key, SUM(post_count)
+        FROM channel_hourly_stats
+        WHERE date_key = ?
+        GROUP BY hour_key
+        """,
+        (target_date,),
+    )
+    rows = dict(cursor.fetchall())
+    connection.close()
+
+    max_count = max(rows.values()) if rows else 0
+    distribution = []
+    for h in range(24):
+        cnt = rows.get(h, 0)
+        distribution.append(
+            {
+                "hour": h,
+                "label": f"{h:02d}:00",
+                "post_count": cnt,
+                "is_peak": (cnt == max_count and cnt > 0),
+            }
+        )
+    return distribution
+
+
+def get_channel_volume_summary(date_key: str | None = None) -> dict:
+    """
+    Returns aggregated traffic summary for a given date:
+    total posts, active channels count, peak hour, peak hour volume.
+    """
+    from datetime import datetime
+
+    target_date = date_key or datetime.now().strftime("%Y-%m-%d")
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        """
+        SELECT 
+            COALESCE(SUM(post_count), 0),
+            COUNT(DISTINCT channel_id)
+        FROM channel_hourly_stats
+        WHERE date_key = ?
+        """,
+        (target_date,),
+    )
+    row = cursor.fetchone()
+    total_posts = row[0] if row else 0
+    active_channels = row[1] if row else 0
+
+    cursor.execute(
+        """
+        SELECT hour_key, SUM(post_count) as total
+        FROM channel_hourly_stats
+        WHERE date_key = ?
+        GROUP BY hour_key
+        ORDER BY total DESC
+        LIMIT 1
+        """,
+        (target_date,),
+    )
+    peak_row = cursor.fetchone()
+    connection.close()
+
+    peak_hour = peak_row[0] if peak_row else None
+    peak_count = peak_row[1] if peak_row else 0
+
+    return {
+        "date_key": target_date,
+        "total_posts": total_posts,
+        "active_channels": active_channels,
+        "peak_hour": peak_hour,
+        "peak_hour_label": f"{peak_hour:02d}:00" if peak_hour is not None else "N/A",
+        "peak_hour_volume": peak_count,
+    }
 
 
 create_table()
