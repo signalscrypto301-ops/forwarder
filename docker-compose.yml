@@ -15,9 +15,9 @@ services:
       - ./Whatsapp/uploads:/app/uploads
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:5426/health"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+      interval: 10s
+      timeout: 5s
+      retries: 5
       start_period: 30s
     restart: unless-stopped
     networks:
@@ -31,7 +31,8 @@ services:
       - ./Telegram:/app
     restart: unless-stopped
     depends_on:
-      - whatsapp-bot
+      whatsapp-bot:
+        condition: service_healthy
     command: sh -c "python bot.py"
     networks:
       - app-network
