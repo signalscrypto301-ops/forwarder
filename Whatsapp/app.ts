@@ -286,8 +286,9 @@ app.get("/health", (req, res) => {
     const safeId = sanitizeClientId(req.query.clientId || clientId);
     const entry = sessions[safeId];
     const ready = Boolean(entry && entry.isReady && entry.sock);
+    const isLiveProbe = req.query.live === "1" || req.query.probe === "liveness";
     const mem = process.memoryUsage();
-    res.status(ready ? 200 : 503).json({
+    res.status((ready || isLiveProbe) ? 200 : 503).json({
         status: ready ? "ready" : "initializing",
         clientId: safeId,
         sessionsCount: Object.keys(sessions).length,
