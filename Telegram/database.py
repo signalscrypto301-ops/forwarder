@@ -10,8 +10,15 @@ def clean_id(channel_id):
     return cid
 
 
+def get_connection():
+    conn = sqlite3.connect("database.db", timeout=10)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
 def create_table():
-    connection = sqlite3.connect("database.db")
+    connection = get_connection()
     cursor = connection.cursor()
 
     # Table for Telegram channels
@@ -35,6 +42,14 @@ def create_table():
         """
     )
 
+    # Index for fast channel lookup
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_channel_groups_channel_id
+        ON channel_groups(channel_id)
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -43,7 +58,7 @@ def add_channel(channel_id):
     channel_id = clean_id(channel_id)
     if not channel_id:
         return
-    connection = sqlite3.connect("database.db")
+    connection = get_connection()
     cursor = connection.cursor()
     cursor.execute("SELECT COUNT(*) FROM channels WHERE channel_id = ?", (channel_id,))
     if cursor.fetchone()[0] == 0:
@@ -57,7 +72,7 @@ def add_group_for_channel(channel_id, group_id):
     group_id = str(group_id).strip()
     if not channel_id or not group_id:
         return
-    connection = sqlite3.connect("database.db")
+    connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(
         "SELECT COUNT(*) FROM channel_groups WHERE channel_id = ? AND group_id = ?",
@@ -73,7 +88,7 @@ def add_group_for_channel(channel_id, group_id):
 
 
 def get_all_channels():
-    connection = sqlite3.connect("database.db")
+    connection = get_connection()
     cursor = connection.cursor()
     cursor.execute("SELECT channel_id FROM channels")
     channels = cursor.fetchall()
@@ -83,7 +98,7 @@ def get_all_channels():
 
 def get_groups_for_channel(channel_id):
     channel_id = clean_id(channel_id)
-    connection = sqlite3.connect("database.db")
+    connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(
         "SELECT group_id FROM channel_groups WHERE channel_id = ?", (channel_id,)
@@ -96,7 +111,7 @@ def get_groups_for_channel(channel_id):
 def delete_group_for_channel(channel_id, group_id):
     channel_id = clean_id(channel_id)
     group_id = str(group_id).strip()
-    connection = sqlite3.connect("database.db")
+    connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(
         "DELETE FROM channel_groups WHERE channel_id = ? AND group_id = ?",

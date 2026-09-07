@@ -21,6 +21,19 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage });
 
+// ---------- Clean Stale Chromium Locks (including dangling symlinks) ----------
+
+function cleanProfileLocks(id: string) {
+    const authPath = path.join(".wwebjs_auth", `session-${id}`);
+    for (const lockfile of ["SingletonLock", "SingletonSocket", "SingletonCookie"]) {
+        const p = path.join(authPath, lockfile);
+        try {
+            fs.unlinkSync(p);
+            console.log(`?? Cleared stale lock: ${lockfile} for ${id}`);
+        } catch (_) {}
+    }
+}
+
 // ---------- Error & Crash Handler for Puppeteer ----------
 
 function handleClientCrash(id: string, error: any) {
@@ -49,6 +62,8 @@ function handleClientCrash(id: string, error: any) {
 // ---------- Session Management with Reconnect Logic ----------
 
 function createOrRestartSession(id: string) {
+    cleanProfileLocks(id);
+
     if (sessions[id]) {
         try {
             sessions[id].destroy().catch(() => {});
@@ -115,6 +130,16 @@ function startSession(id: string) {
 }
 
 // ---------- Express Routes ----------
+
+app.get("/health", (req, res) => {
+    const ready = Boolean(sessions[clientId] && sessions[clientId].info);
+    res.status(ready ? 200 : 503).json({
+        status: ready ? "ready" : "initializing",
+        clientId,
+        sessionsCount: Object.keys(sessions).length,
+        timestamp: new Date().toISOString()
+    });
+});
 
 app.post("/createsession", (req, res) => {
     const targetId = req.body.clientId || clientId;

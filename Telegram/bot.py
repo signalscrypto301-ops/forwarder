@@ -33,6 +33,9 @@ bot_client = TelegramClient("bot_client", config.API_ID, config.API_HASH).start(
     bot_token=config.bot_token
 )
 
+# Concurrency limiter to protect WhatsApp Web and network resources
+UPLOAD_SEMAPHORE = asyncio.Semaphore(3)
+
 
 def generate_qr_code(qr_data: str) -> str:
     qr = qrcode.QRCode(
@@ -317,9 +320,9 @@ async def view_channels_command(message: Message):
 
 def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> str:
     if not caption or not entities:
-        return caption
+        return caption or ""
 
-    # Convert caption to UTF-16 to match Telegram's offset logic
+    # Convert caption to UTF-16 to match Telegram's entity offset logic
     utf16_text = caption.encode("utf-16-le")
     code_units = []
     i = 0
@@ -338,40 +341,106 @@ def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> 
         utf16_idx += utf16_len
         str_idx += 1
 
-    # Collect where to insert symbols
-    insertions = {}
+    prefix_insertions = {}
+    suffix_insertions = {}
 
     for ent in entities:
-        symbol = ""
+        prefix = ""
+        suffix = ""
         if ent.type == "bold":
-            symbol = "*"
+            prefix, suffix = "*", "*"
         elif ent.type == "italic":
-            symbol = "_"
+            prefix, suffix = "_", "_"
         elif ent.type == "strikethrough":
-            symbol = "~"
+            prefix, suffix = "~", "~"
+        elif ent.type == "code":
+            prefix, suffix = "`", "`"
+        elif ent.type == "pre":
+            prefix, suffix = "```\n", "\n```"
+        elif ent.type == "spoiler":
+            prefix, suffix = "||", "||"
+        elif ent.type == "text_link" and getattr(ent, "url", None):
+            suffix = f" ({ent.url})"
         else:
-            continue  # unsupported
+            continue
 
         start = utf16_to_str_idx.get(ent.offset)
         end = utf16_to_str_idx.get(ent.offset + ent.length)
 
-        if start is not None:
-            insertions.setdefault(start, []).append(symbol)
-        if end is not None:
-            insertions.setdefault(end, []).append(symbol)
+        if start is not None and prefix:
+            prefix_insertions.setdefault(start, []).append(prefix)
+        if end is not None and suffix:
+            suffix_insertions.setdefault(end, []).append(suffix)
 
-    # Build result string with correct offsets
     result = []
     for i, ch in enumerate(caption):
-        if i in insertions:
-            result.extend(insertions[i])
+        if i in prefix_insertions:
+            result.extend(prefix_insertions[i])
         result.append(ch)
+        if (i + 1) in suffix_insertions:
+            result.extend(suffix_insertions[i + 1])
 
-    # Add any insertions after the last char
-    if len(caption) in insertions:
-        result.extend(insertions[len(caption)])
+    if len(caption) in suffix_insertions:
+        result.extend(suffix_insertions[len(caption)])
 
     return "".join(result)
+
+
+async def send_to_single_group(group: str, downloaded_media: str | None, caption: str):
+    async with UPLOAD_SEMAPHORE:
+        if downloaded_media:
+            if not os.path.exists(downloaded_media):
+                logger.error(f"Downloaded media {downloaded_media} does not exist for group {group}.")
+                return
+
+            def send_media_sync(path, grp, cap):
+                with open(path, "rb") as media_file:
+                    files = {"media": media_file}
+                    data = {"clientId": "user", "groupId": grp, "caption": cap}
+                    return requests.post(
+                        url=f"{config.whatsapp_service}/sendMedia",
+                        data=data,
+                        files=files,
+                        timeout=60,
+                    )
+
+            try:
+                response = await asyncio.to_thread(
+                    send_media_sync, downloaded_media, group, caption
+                )
+                if response.status_code == 200:
+                    logger.info(f"Media message sent to group {group} successfully.")
+                else:
+                    msg = (
+                        response.json().get("message")
+                        if response.headers.get("content-type", "").startswith("application/json")
+                        else response.text
+                    )
+                    logger.error(f"Failed to send media message to group {group}: {msg}")
+            except Exception as e:
+                logger.error(f"Error sending media message to group {group}: {e}")
+        else:
+            def send_text_sync(grp, txt):
+                data = {"clientId": "user", "groupId": grp, "text": txt}
+                return requests.post(
+                    url=f"{config.whatsapp_service}/sendText",
+                    json=data,
+                    timeout=30,
+                )
+
+            try:
+                response = await asyncio.to_thread(send_text_sync, group, caption)
+                if response.status_code == 200:
+                    logger.info(f"Text message sent to group {group} successfully.")
+                else:
+                    msg = (
+                        response.json().get("message")
+                        if response.headers.get("content-type", "").startswith("application/json")
+                        else response.text
+                    )
+                    logger.error(f"Failed to send text message to group {group}: {msg}")
+            except Exception as e:
+                logger.error(f"Error sending text message to group {group}: {e}")
 
 
 @dp.channel_post_handler(
@@ -391,7 +460,7 @@ async def handle_channel_post(message: types.Message):
             caption = message.text or ""
         elif message.content_type == ContentType.PHOTO:
             caption = message.caption or ""
-            photo = message.photo[-1]  # Get the highest resolution photo
+            photo = message.photo[-1]  # Highest resolution photo
             photo_path = f"{photo.file_unique_id}.jpg"
             try:
                 await photo.download(destination_file=photo_path)
@@ -434,56 +503,10 @@ async def handle_channel_post(message: types.Message):
 
         caption = format_caption_for_whatsapp(caption, message.caption_entities or [])
 
-        for group in groups:
-            if downloaded_media:
-                if not os.path.exists(downloaded_media):
-                    logger.error(f"Downloaded media {downloaded_media} does not exist for group {group}.")
-                    break
-
-                def send_media_sync(path, grp, cap):
-                    with open(path, "rb") as media_file:
-                        files = {"media": media_file}
-                        data = {"clientId": "user", "groupId": grp, "caption": cap}
-                        return requests.post(
-                            url=f"{config.whatsapp_service}/sendMedia",
-                            data=data,
-                            files=files,
-                            timeout=60,
-                        )
-
-                try:
-                    response = await asyncio.to_thread(
-                        send_media_sync, downloaded_media, group, caption
-                    )
-                    if response.status_code == 200:
-                        logger.info(f"Media message sent to group {group} successfully.")
-                    else:
-                        msg = response.json().get('message') if response.headers.get('content-type', '').startswith('application/json') else response.text
-                        logger.error(
-                            f"Failed to send media message to group {group}: {msg}"
-                        )
-                except Exception as e:
-                    logger.error(f"Error sending media message to group {group}: {e}")
-            else:
-                def send_text_sync(grp, txt):
-                    data = {"clientId": "user", "groupId": grp, "text": txt}
-                    return requests.post(
-                        url=f"{config.whatsapp_service}/sendText",
-                        json=data,
-                        timeout=30,
-                    )
-
-                try:
-                    response = await asyncio.to_thread(send_text_sync, group, caption)
-                    if response.status_code == 200:
-                        logger.info(f"Text message sent to group {group} successfully.")
-                    else:
-                        msg = response.json().get('message') if response.headers.get('content-type', '').startswith('application/json') else response.text
-                        logger.error(
-                            f"Failed to send text message to group {group}: {msg}"
-                        )
-                except Exception as e:
-                    logger.error(f"Error sending text message to group {group}: {e}")
+        # Parallel fan-out bounded by UPLOAD_SEMAPHORE
+        await asyncio.gather(
+            *(send_to_single_group(group, downloaded_media, caption) for group in groups)
+        )
 
     except Exception as e:
         logger.error(f"Unexpected error handling channel post: {e}", exc_info=True)
