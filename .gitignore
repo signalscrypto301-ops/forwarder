@@ -1,10 +1,45 @@
+# Dependencies & caches
 node_modules/
 __pycache__/
-*.pyc
-*.log
-*.log.*
+*.py[cod]
+*$py.class
 .DS_Store
+
+# Secrets & environment configurations
+.env
+*.env
+Telegram/config.yml
+Telegram/config*.yml
+!Telegram/config.example.yml
+
+# Databases & runtime states
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Sessions & authentication
+*.session
+*.session-*
+bot_client.session*
+.wwebjs_auth/
+Whatsapp/.wwebjs_auth/
+.baileys_auth/
+Whatsapp/.baileys_auth/
+
+# Media, uploads & temp files
 Telegram/media/
+Whatsapp/uploads/
 Telegram/*.jpg
 Telegram/*.png
-Whatsapp/uploads/
+Telegram/*.mp4
+Telegram/*.ogg
+Telegram/*.mp3
+qr_*.png
+
+# Logs
+*.log
+*.log.*
+admin.log*
+auto_sync.log*
+

@@ -1,0 +1,15 @@
+settings:
+  bot_token: "YOUR_TELEGRAM_BOT_TOKEN"
+  admin_ids: [123456789]
+  whatsapp_service: "http://whatsapp-bot:5426"
+  API_ID: 12345678
+  API_HASH: "your_telethon_api_hash"
+  api_secret: "change_this_to_a_secure_random_secret_token"
+
+rate_limits:
+  max_per_hour: 120
+  max_per_day: 1000
+  alert_threshold_percent: 80.0
+  per_recipient_rate: 0.2     # 1 token every 5s per group/channel
+  per_recipient_burst: 3      # Maximum burst allowance
+

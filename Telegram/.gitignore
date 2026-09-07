@@ -1,9 +1,22 @@
 *.log
 *.log.*
-__pycache__
-myenv
+__pycache__/
+myenv/
+venv/
+.venv/
+.env
+*.env
 config.yml
+config*.yml
+!config.example.yml
 database.db
-config copy.yml
+database.db*
 *.session
-*.session-journal
+*.session*
+media/
+*.jpg
+*.png
+*.mp4
+*.ogg
+*.mp3
+qr_*.png

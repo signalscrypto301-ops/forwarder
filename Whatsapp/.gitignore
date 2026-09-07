@@ -1,4 +1,8 @@
-node_modules
+node_modules/
 .env
-.wwebjs_auth
-uploads
+*.env
+.wwebjs_auth/
+.baileys_auth/
+uploads/
+*.log
+*.log.*

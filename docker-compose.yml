@@ -4,11 +4,14 @@ networks:
 services:
   whatsapp-bot:
     build: ./Whatsapp
-    shm_size: 1gb
     ports:
       - "127.0.0.1:5426:5426"
+    environment:
+      - API_SECRET=forwarder_internal_secret_key_8f3a92b
+      - PORT=5426
+      - CLIENT_ID=user
     volumes:
-      - ./Whatsapp/.wwebjs_auth:/app/.wwebjs_auth
+      - ./Whatsapp/.baileys_auth:/app/.baileys_auth
       - ./Whatsapp/uploads:/app/uploads
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "-", "http://localhost:5426/health"]
@@ -21,6 +24,9 @@ services:
       - app-network
   telegram-bot:
     build: ./Telegram
+    environment:
+      - API_SECRET=forwarder_internal_secret_key_8f3a92b
+      - WHATSAPP_SERVICE=http://whatsapp-bot:5426
     volumes:
       - ./Telegram:/app
     restart: unless-stopped
@@ -29,3 +35,4 @@ services:
     command: sh -c "python bot.py"
     networks:
       - app-network
+
