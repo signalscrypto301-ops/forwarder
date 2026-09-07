@@ -29,13 +29,12 @@ from database import (
 bot = aiogram.Bot(config.bot_token)
 dp = aiogram.Dispatcher(bot)
 
-
 bot_client = TelegramClient("bot_client", config.API_ID, config.API_HASH).start(
     bot_token=config.bot_token
 )
 
 
-def generate_qr_code(qr_data):
+def generate_qr_code(qr_data: str) -> str:
     qr = qrcode.QRCode(
         version=1,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -45,7 +44,7 @@ def generate_qr_code(qr_data):
     qr.add_data(qr_data)
     qr.make(fit=True)
     img = qr.make_image(fill_color="black", back_color="white")
-    image_path = os.path.join(os.getcwd(), f"{qr_data[10]}.png")
+    image_path = os.path.join(os.getcwd(), f"qr_{int(datetime.now().timestamp())}.png")
     img.save(image_path)
     return image_path
 
@@ -66,7 +65,7 @@ async def get_chat_id_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     args = message.get_args()
@@ -79,62 +78,89 @@ async def get_chat_id_command(message: Message):
         "clientId": "user",
     }
 
-    res = requests.post(url=f"{config.whatsapp_service}/getChatId", json=data)
-    res_data = res.json()
-    if res.status_code == 200:
-        await message.reply(
-            f"Group Id : <code>{res_data.get('groupId')}</code>",
-            parse_mode=ParseMode.HTML,
+    try:
+        res = await asyncio.to_thread(
+            requests.post, url=f"{config.whatsapp_service}/getChatId", json=data, timeout=30
         )
-    elif res.status_code == 400 or res.status_code == 404:
-        await message.reply(f"{res_data.get('message')}", parse_mode=ParseMode.HTML)
-    else:
-        await message.reply("Something went wrong.")
+        res_data = res.json()
+        if res.status_code == 200:
+            await message.reply(
+                f"Group Id : <code>{res_data.get('groupId')}</code>",
+                parse_mode=ParseMode.HTML,
+            )
+        elif res.status_code in (400, 404):
+            await message.reply(f"{res_data.get('message')}", parse_mode=ParseMode.HTML)
+        else:
+            await message.reply("Something went wrong.")
+    except Exception as e:
+        logger.error(f"Error in get_chat_id: {e}")
+        await message.reply("Failed to connect to WhatsApp service.")
 
 
 @dp.message_handler(commands=["login"])
 async def login_whatsapp(message: Message):
-    data = {
-        "clientId": "user",
-    }
-
-    res = requests.post(url=f"{config.whatsapp_service}/createsession", json=data)
-    res_data = res.json()
-
-    if res.status_code == 200:
-        qr_data = res_data.get("qrcode")
-        qr_image = generate_qr_code(qr_data)
-
-        with open(qr_image, "rb") as qr_image:
-            await message.reply_photo(qr_image)
-            os.remove(qr_image.name)
-
-    elif res.status_code == 400:
-        await message.reply(f"{res_data.get('message')}")
-
-
-@dp.message_handler(commands=["listen"])
-async def listen_whatsapp(message: Message):
-
     if not message.chat.type == "private":
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     data = {
         "clientId": "user",
     }
 
-    res = requests.post(url=f"{config.whatsapp_service}/startlistening", json=data)
-    res_data = res.json()
-    if res.status_code == 200:
-        await message.reply(f"{res_data.get('message')}")
-    elif res.status_code == 400:
-        await message.reply(f"{res_data.get('message')}")
-    else:
-        await message.reply("Something went wrong.")
+    try:
+        res = await asyncio.to_thread(
+            requests.post, url=f"{config.whatsapp_service}/createsession", json=data, timeout=30
+        )
+        res_data = res.json()
+
+        if res.status_code == 200:
+            qr_data = res_data.get("qrcode")
+            qr_path = generate_qr_code(qr_data)
+            try:
+                with open(qr_path, "rb") as qr_fp:
+                    await message.reply_photo(qr_fp)
+            finally:
+                if os.path.exists(qr_path):
+                    os.remove(qr_path)
+        elif res.status_code == 400:
+            await message.reply(f"{res_data.get('message')}")
+        else:
+            await message.reply("Failed to create session.")
+    except Exception as e:
+        logger.error(f"Error in login_whatsapp: {e}")
+        await message.reply("Error contacting WhatsApp service.")
+
+
+@dp.message_handler(commands=["listen"])
+async def listen_whatsapp(message: Message):
+    if not message.chat.type == "private":
+        return
+
+    user_id = message.from_user.id
+    if user_id not in config.admin_ids:
+        return
+
+    data = {
+        "clientId": "user",
+    }
+
+    try:
+        res = await asyncio.to_thread(
+            requests.post, url=f"{config.whatsapp_service}/startlistening", json=data, timeout=30
+        )
+        res_data = res.json()
+        if res.status_code == 200:
+            await message.reply(f"{res_data.get('message')}")
+        elif res.status_code == 400:
+            await message.reply(f"{res_data.get('message')}")
+        else:
+            await message.reply("Something went wrong.")
+    except Exception as e:
+        logger.error(f"Error in listen_whatsapp: {e}")
+        await message.reply("Failed to connect to WhatsApp service.")
 
 
 @dp.message_handler(commands=["logout"])
@@ -143,20 +169,26 @@ async def logout_whatsapp(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     data = {
         "clientId": "user",
     }
 
-    res = requests.post(url=f"{config.whatsapp_service}/logout", json=data)
-    if res.status_code == 200:
-        await message.reply("Logged out and session files removed successfully.")
-    elif res.status_code == 400:
-        await message.reply(f"{res.json().get('message')}")
-    else:
-        await message.reply("Failed to log out. Please try again later.")
+    try:
+        res = await asyncio.to_thread(
+            requests.post, url=f"{config.whatsapp_service}/logout", json=data, timeout=30
+        )
+        if res.status_code == 200:
+            await message.reply("Logged out and session files removed successfully.")
+        elif res.status_code == 400:
+            await message.reply(f"{res.json().get('message')}")
+        else:
+            await message.reply("Failed to log out. Please try again later.")
+    except Exception as e:
+        logger.error(f"Error in logout_whatsapp: {e}")
+        await message.reply("Failed to connect to WhatsApp service.")
 
 
 @dp.message_handler(commands=["add_group"])
@@ -165,7 +197,7 @@ async def add_group_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     args = message.get_args()
@@ -184,7 +216,7 @@ async def delete_group_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     args = message.get_args()
@@ -203,7 +235,7 @@ async def view_groups_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     channels = get_all_channels()
@@ -224,7 +256,7 @@ async def add_channel_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     args = message.get_args()
@@ -242,12 +274,12 @@ async def add_group_for_channel_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     args = message.get_args()
     if not args or len(args.split()) != 2:
-        await message.reply("Usage: /add_group_for_channel <channel_id> <group_id>")
+        await message.reply("Usage: /add_wp_channel <channel_id> <group_id>")
         return
 
     channel_id, group_id = args.split()
@@ -268,7 +300,7 @@ async def view_channels_command(message: Message):
         return
 
     user_id = message.from_user.id
-    if not user_id in config.admin_ids:
+    if user_id not in config.admin_ids:
         return
 
     channels = get_all_channels()
@@ -353,76 +385,114 @@ async def handle_channel_post(message: types.Message):
 
     caption = ""
     downloaded_media = None
-    if message.content_type == ContentType.TEXT:
-        caption = message.text
-    elif message.content_type == ContentType.PHOTO:
-        caption = message.caption
-        photo = message.photo[-1]  # Get the highest resolution photo
-        photo_path = f"{photo.file_unique_id}.jpg"
-        await photo.download(destination_file=photo_path)
-        downloaded_media = photo_path
-    # download the video if it exists, download upto 100 MB only
-    elif message.content_type == ContentType.VIDEO:
-        caption = message.caption
-        media_dir = "media"
-        os.makedirs(media_dir, exist_ok=True)
-        video_file_path = os.path.join(media_dir, f"{message.video.file_unique_id}.mp4")
-        video_message = await bot_client.get_messages(
-            message.chat.id, ids=message.message_id
-        )
 
-        await video_message.download_media(file=video_file_path)
+    try:
+        if message.content_type == ContentType.TEXT:
+            caption = message.text or ""
+        elif message.content_type == ContentType.PHOTO:
+            caption = message.caption or ""
+            photo = message.photo[-1]  # Get the highest resolution photo
+            photo_path = f"{photo.file_unique_id}.jpg"
+            try:
+                await photo.download(destination_file=photo_path)
+                if os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
+                    downloaded_media = photo_path
+                else:
+                    logger.error(f"Downloaded photo {photo_path} is missing or empty.")
+                    if os.path.exists(photo_path):
+                        os.remove(photo_path)
+            except Exception as e:
+                logger.error(f"Failed to download photo {photo_path}: {e}")
+                if os.path.exists(photo_path):
+                    os.remove(photo_path)
 
-        # check file size is less than 100 MB
-        if os.path.getsize(video_file_path) > 100 * 1024 * 1024:
-            os.remove(video_file_path)
-            logger.info("Video size exceeds 100 MB limit.")
-            return
+        elif message.content_type == ContentType.VIDEO:
+            caption = message.caption or ""
+            media_dir = "media"
+            os.makedirs(media_dir, exist_ok=True)
+            video_file_path = os.path.join(media_dir, f"{message.video.file_unique_id}.mp4")
+            try:
+                video_message = await bot_client.get_messages(
+                    message.chat.id, ids=message.message_id
+                )
+                await video_message.download_media(file=video_file_path)
 
-        downloaded_media = video_file_path
+                if os.path.exists(video_file_path) and os.path.getsize(video_file_path) > 0:
+                    if os.path.getsize(video_file_path) > 100 * 1024 * 1024:
+                        os.remove(video_file_path)
+                        logger.info("Video size exceeds 100 MB limit.")
+                        return
+                    downloaded_media = video_file_path
+                else:
+                    logger.error(f"Downloaded video {video_file_path} is missing or empty.")
+                    if os.path.exists(video_file_path):
+                        os.remove(video_file_path)
+            except Exception as e:
+                logger.error(f"Failed to download video {video_file_path}: {e}")
+                if os.path.exists(video_file_path):
+                    os.remove(video_file_path)
 
-    caption = format_caption_for_whatsapp(caption, message.caption_entities or [])
+        caption = format_caption_for_whatsapp(caption, message.caption_entities or [])
 
-    for group in groups:
-        if downloaded_media:
-            # Sending media message
-            with open(downloaded_media, "rb") as media_file:
-                files = {"media": media_file}
-                data = {"clientId": "user", "groupId": group, "caption": caption}
+        for group in groups:
+            if downloaded_media:
+                if not os.path.exists(downloaded_media):
+                    logger.error(f"Downloaded media {downloaded_media} does not exist for group {group}.")
+                    break
+
+                def send_media_sync(path, grp, cap):
+                    with open(path, "rb") as media_file:
+                        files = {"media": media_file}
+                        data = {"clientId": "user", "groupId": grp, "caption": cap}
+                        return requests.post(
+                            url=f"{config.whatsapp_service}/sendMedia",
+                            data=data,
+                            files=files,
+                            timeout=60,
+                        )
+
                 try:
-                    response = requests.post(
-                        url=f"{config.whatsapp_service}/sendMedia",
-                        data=data,
-                        files=files,
+                    response = await asyncio.to_thread(
+                        send_media_sync, downloaded_media, group, caption
                     )
                     if response.status_code == 200:
-                        logger.info(
-                            f"Media message sent to group {group} successfully."
-                        )
+                        logger.info(f"Media message sent to group {group} successfully.")
                     else:
+                        msg = response.json().get('message') if response.headers.get('content-type', '').startswith('application/json') else response.text
                         logger.error(
-                            f"Failed to send media message to group {group}: {response.json().get('message')}"
+                            f"Failed to send media message to group {group}: {msg}"
                         )
                 except Exception as e:
                     logger.error(f"Error sending media message to group {group}: {e}")
-        else:
-            # Sending text message
-            data = {"clientId": "user", "groupId": group, "text": caption}
-            try:
-                response = requests.post(
-                    url=f"{config.whatsapp_service}/sendText", json=data
-                )
-                if response.status_code == 200:
-                    logger.info(f"Text message sent to group {group} successfully.")
-                else:
-                    logger.error(
-                        f"Failed to send text message to group {group}: {response.json().get('message')}"
+            else:
+                def send_text_sync(grp, txt):
+                    data = {"clientId": "user", "groupId": grp, "text": txt}
+                    return requests.post(
+                        url=f"{config.whatsapp_service}/sendText",
+                        json=data,
+                        timeout=30,
                     )
-            except Exception as e:
-                logger.error(f"Error sending text message to group {group}: {e}")
 
-    if downloaded_media:
-        os.remove(downloaded_media)
+                try:
+                    response = await asyncio.to_thread(send_text_sync, group, caption)
+                    if response.status_code == 200:
+                        logger.info(f"Text message sent to group {group} successfully.")
+                    else:
+                        msg = response.json().get('message') if response.headers.get('content-type', '').startswith('application/json') else response.text
+                        logger.error(
+                            f"Failed to send text message to group {group}: {msg}"
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending text message to group {group}: {e}")
+
+    except Exception as e:
+        logger.error(f"Unexpected error handling channel post: {e}", exc_info=True)
+    finally:
+        if downloaded_media and os.path.exists(downloaded_media):
+            try:
+                os.remove(downloaded_media)
+            except Exception as e:
+                logger.error(f"Failed to remove {downloaded_media}: {e}")
 
 
 async def main(_):

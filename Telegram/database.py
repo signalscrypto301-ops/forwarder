@@ -1,6 +1,15 @@
 import sqlite3
 
 
+def clean_id(channel_id):
+    if not channel_id:
+        return ""
+    cid = str(channel_id).strip()
+    if cid.lower().startswith("id:"):
+        cid = cid[3:].strip()
+    return cid
+
+
 def create_table():
     connection = sqlite3.connect("database.db")
     cursor = connection.cursor()
@@ -31,6 +40,9 @@ def create_table():
 
 
 def add_channel(channel_id):
+    channel_id = clean_id(channel_id)
+    if not channel_id:
+        return
     connection = sqlite3.connect("database.db")
     cursor = connection.cursor()
     cursor.execute("SELECT COUNT(*) FROM channels WHERE channel_id = ?", (channel_id,))
@@ -41,6 +53,10 @@ def add_channel(channel_id):
 
 
 def add_group_for_channel(channel_id, group_id):
+    channel_id = clean_id(channel_id)
+    group_id = str(group_id).strip()
+    if not channel_id or not group_id:
+        return
     connection = sqlite3.connect("database.db")
     cursor = connection.cursor()
     cursor.execute(
@@ -62,10 +78,11 @@ def get_all_channels():
     cursor.execute("SELECT channel_id FROM channels")
     channels = cursor.fetchall()
     connection.close()
-    return [ch[0] for ch in channels]
+    return [clean_id(ch[0]) for ch in channels if clean_id(ch[0])]
 
 
 def get_groups_for_channel(channel_id):
+    channel_id = clean_id(channel_id)
     connection = sqlite3.connect("database.db")
     cursor = connection.cursor()
     cursor.execute(
@@ -77,6 +94,8 @@ def get_groups_for_channel(channel_id):
 
 
 def delete_group_for_channel(channel_id, group_id):
+    channel_id = clean_id(channel_id)
+    group_id = str(group_id).strip()
     connection = sqlite3.connect("database.db")
     cursor = connection.cursor()
     cursor.execute(

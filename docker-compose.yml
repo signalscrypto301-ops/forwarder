@@ -6,7 +6,7 @@ services:
     build: ./Whatsapp
     shm_size: 1gb
     ports:
-      - "5426:5426"
+      - "127.0.0.1:5426:5426"
     volumes:
       - ./Whatsapp/.wwebjs_auth:/app/.wwebjs_auth
       - ./Whatsapp/uploads:/app/uploads
