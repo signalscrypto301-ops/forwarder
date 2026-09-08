@@ -105,6 +105,12 @@ last_auth_alert_time = 0.0
 ALBUM_LOCK = asyncio.Lock()
 PROCESSED_MEDIA_GROUPS: dict[str, dict] = {}
 
+# ---------- Session Watchdog State ----------
+_watchdog_consecutive_failures: int = 0   # consecutive /health checks returning not-ready
+_watchdog_outage_start: float | None = None  # timestamp when outage was first detected
+_watchdog_reconnect_lock = asyncio.Lock()   # prevents concurrent reconnect attempts
+_watchdog_last_reconnect_at: float = 0.0   # last time we called /createsession
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in config.admin_ids
@@ -301,6 +307,7 @@ async def help_command(message: Message):
         "▶️ /resume_all - Resume forwarding on all channels\n"
         "🪄 /map [channel_id] - One-tap interactive WhatsApp group mapper wizard\n"
         "🛡️ /health_stats - WhatsApp deliverability rate & safety metrics\n"
+        "🩺 /watchdog - WhatsApp socket health monitor & auto-reconnect status\n"
         "🔑 /login - Generate WhatsApp login QR code\n"
         "🚪 /logout - Disconnect and clean WhatsApp session\n"
         "🔍 /get_chat_id &lt;group_name&gt; - Find WhatsApp group or newsletter JID\n"
@@ -2667,6 +2674,232 @@ async def handle_channel_post(message: types.Message):
                 logger.error(f"Failed to remove {downloaded_media}: {e}")
 
 
+# ---------- Session Watchdog (/watchdog) ----------
+
+WATCHDOG_CHECK_INTERVAL = 5 * 60        # ping /health every 5 minutes
+WATCHDOG_FAILURE_THRESHOLD = 3          # raise alert after this many consecutive failures
+WATCHDOG_RECONNECT_COOLDOWN = 10 * 60   # minimum seconds between /createsession calls
+
+
+async def _get_whatsapp_health() -> bool:
+    """
+    Pings the WhatsApp service /health endpoint.
+    Returns True if the session is ready, False on any failure or not-ready status.
+    Uses the liveness probe flag (?live=1 always 200) intentionally NOT set here —
+    we want the real session-ready status, not just HTTP server liveness.
+    """
+    try:
+        session = await get_http_session()
+        url = f"{config.whatsapp_service}/health"
+        if session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    return data.get("status") == "ready"
+                return False
+        else:
+            def _sync_get():
+                return requests.get(url, headers=get_http_headers(), timeout=10)
+            r = await asyncio.to_thread(_sync_get)
+            return r.status_code == 200 and r.json().get("status") == "ready"
+    except Exception as e:
+        logger.debug(f"[Watchdog] /health check failed: {e}")
+        return False
+
+
+async def _watchdog_attempt_reconnect():
+    """
+    Attempts to trigger Baileys /createsession to auto-reconnect the WhatsApp socket.
+    Respects a cooldown to avoid hammering the service.
+    """
+    global _watchdog_last_reconnect_at
+    if _watchdog_reconnect_lock.locked():
+        logger.debug("[Watchdog] Reconnect already in progress, skipping.")
+        return
+
+    now = time.time()
+    if now - _watchdog_last_reconnect_at < WATCHDOG_RECONNECT_COOLDOWN:
+        remaining = int(WATCHDOG_RECONNECT_COOLDOWN - (now - _watchdog_last_reconnect_at))
+        logger.debug(f"[Watchdog] Reconnect cooldown active, {remaining}s remaining.")
+        return
+
+    async with _watchdog_reconnect_lock:
+        _watchdog_last_reconnect_at = time.time()
+        logger.info("[Watchdog] Triggering /createsession to auto-reconnect WhatsApp socket...")
+        try:
+            status, data = await post_whatsapp_json("createsession", {"clientId": "user"}, timeout_sec=30)
+            if status == 200 and data.get("ready"):
+                logger.info("[Watchdog] /createsession reported session is already ready.")
+            elif data.get("qrcode"):
+                logger.warning("[Watchdog] /createsession returned a QR code — manual login required.")
+            elif status == 202:
+                logger.info("[Watchdog] /createsession started session initialization in background.")
+            else:
+                logger.warning(f"[Watchdog] /createsession responded {status}: {data}")
+        except Exception as e:
+            logger.error(f"[Watchdog] Failed to call /createsession: {e}")
+
+
+async def scheduled_session_watchdog_loop():
+    """
+    Background watchdog that monitors the WhatsApp/Baileys session health every 5 minutes.
+
+    Behaviour:
+    - Pings /health (real session-ready status, not liveness probe) every 5 min.
+    - Tracks consecutive not-ready results.
+    - On >= 3 consecutive failures:
+        1. Alerts admins via notify_admins_auth_required().
+        2. Calls /createsession to attempt automatic reconnect (with 10-min cooldown).
+    - On recovery:
+        - Logs the outage duration.
+        - Sends admins a recovery confirmation message.
+    - Resets counters on recovery.
+
+    Initial warm-up: waits 90 seconds after startup to allow Baileys to fully initialize.
+    """
+    global _watchdog_consecutive_failures, _watchdog_outage_start
+
+    await asyncio.sleep(90)  # give Baileys time to initialize before first check
+    logger.info("[Watchdog] Session watchdog started. Checking every 5 minutes.")
+
+    while True:
+        try:
+            is_ready = await _get_whatsapp_health()
+
+            if is_ready:
+                if _watchdog_consecutive_failures > 0:
+                    # ---- RECOVERY ----
+                    outage_secs = (
+                        int(time.time() - _watchdog_outage_start)
+                        if _watchdog_outage_start
+                        else 0
+                    )
+                    outage_str = (
+                        f"{outage_secs // 60}m {outage_secs % 60}s"
+                        if outage_secs >= 60
+                        else f"{outage_secs}s"
+                    )
+                    logger.info(
+                        f"[Watchdog] ✅ WhatsApp session recovered after {outage_str} "
+                        f"({_watchdog_consecutive_failures} failed checks)."
+                    )
+                    for admin_id in config.admin_ids:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"✅ <b>WhatsApp Session Recovered</b>\n\n"
+                                f"The Baileys socket reconnected successfully.\n"
+                                f"⏱ Outage duration: <b>{outage_str}</b>\n"
+                                f"🔄 Failed health checks: {_watchdog_consecutive_failures}",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception as e:
+                            logger.error(f"[Watchdog] Failed to send recovery alert to admin {admin_id}: {e}")
+
+                    _watchdog_consecutive_failures = 0
+                    _watchdog_outage_start = None
+                else:
+                    logger.debug("[Watchdog] /health OK — session is ready.")
+
+            else:
+                # ---- FAILURE ----
+                _watchdog_consecutive_failures += 1
+                if _watchdog_outage_start is None:
+                    _watchdog_outage_start = time.time()
+
+                logger.warning(
+                    f"[Watchdog] WhatsApp session NOT ready "
+                    f"(consecutive failures: {_watchdog_consecutive_failures}/{WATCHDOG_FAILURE_THRESHOLD})."
+                )
+
+                if _watchdog_consecutive_failures >= WATCHDOG_FAILURE_THRESHOLD:
+                    outage_secs = int(time.time() - _watchdog_outage_start)
+                    outage_str = (
+                        f"{outage_secs // 60}m {outage_secs % 60}s"
+                        if outage_secs >= 60
+                        else f"{outage_secs}s"
+                    )
+                    logger.error(
+                        f"[Watchdog] 🚨 {_watchdog_consecutive_failures} consecutive failures "
+                        f"({outage_str} outage). Alerting admins and attempting reconnect."
+                    )
+
+                    # 1. Alert admins
+                    await notify_admins_auth_required()
+
+                    # Send a detailed watchdog-specific alert (different from generic auth alert)
+                    for admin_id in config.admin_ids:
+                        try:
+                            await bot.send_message(
+                                admin_id,
+                                f"🚨 <b>WhatsApp Session Watchdog Alert</b>\n\n"
+                                f"The Baileys socket has been <b>unreachable for {outage_str}</b> "
+                                f"({_watchdog_consecutive_failures} consecutive health check failures).\n\n"
+                                f"🔄 Attempting automatic reconnection...\n"
+                                f"If reconnection fails, please use /login to re-authenticate.",
+                                parse_mode=ParseMode.HTML,
+                            )
+                        except Exception as e:
+                            logger.error(f"[Watchdog] Failed to send alert to admin {admin_id}: {e}")
+
+                    # 2. Attempt auto-reconnect
+                    await _watchdog_attempt_reconnect()
+
+        except asyncio.CancelledError:
+            logger.info("[Watchdog] Session watchdog loop cancelled.")
+            break
+        except Exception as e:
+            logger.error(f"[Watchdog] Unexpected error in watchdog loop: {e}", exc_info=True)
+
+        await asyncio.sleep(WATCHDOG_CHECK_INTERVAL)
+
+
+@dp.message_handler(commands=["watchdog"])
+async def cmd_watchdog(message: Message):
+    """
+    /watchdog — shows the current session watchdog status.
+    Displays consecutive failure count, outage duration, and last reconnect attempt time.
+    """
+    if not is_admin(message.from_user.id):
+        return
+
+    is_ready = await _get_whatsapp_health()
+
+    if is_ready:
+        session_status = "✅ <b>Ready</b>"
+    elif _watchdog_consecutive_failures > 0:
+        session_status = f"🔴 <b>Not Ready</b> ({_watchdog_consecutive_failures} consecutive failures)"
+    else:
+        session_status = "🟡 <b>Checking...</b>"
+
+    outage_info = ""
+    if _watchdog_outage_start and _watchdog_consecutive_failures > 0:
+        outage_secs = int(time.time() - _watchdog_outage_start)
+        outage_str = (
+            f"{outage_secs // 60}m {outage_secs % 60}s"
+            if outage_secs >= 60
+            else f"{outage_secs}s"
+        )
+        outage_info = f"\n⏱ <b>Outage Duration:</b> {outage_str}"
+
+    last_reconnect = ""
+    if _watchdog_last_reconnect_at > 0:
+        ago = int(time.time() - _watchdog_last_reconnect_at)
+        ago_str = f"{ago // 60}m {ago % 60}s ago" if ago >= 60 else f"{ago}s ago"
+        last_reconnect = f"\n🔄 <b>Last Reconnect Attempt:</b> {ago_str}"
+
+    text = (
+        f"🩺 <b>Session Watchdog Status</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📡 <b>Session:</b> {session_status}{outage_info}{last_reconnect}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"⚙️ <b>Check Interval:</b> {WATCHDOG_CHECK_INTERVAL // 60} min\n"
+        f"⚠️ <b>Alert Threshold:</b> {WATCHDOG_FAILURE_THRESHOLD} consecutive failures\n"
+        f"🔁 <b>Reconnect Cooldown:</b> {WATCHDOG_RECONNECT_COOLDOWN // 60} min"
+    )
+    await message.answer(text, parse_mode=ParseMode.HTML)
+
+
 # ---------- Lifecycle Hooks ----------
 
 
@@ -2753,6 +2986,7 @@ async def on_startup(_):
     asyncio.create_task(periodic_cleanup_task())
     asyncio.create_task(scheduled_daily_report_loop())
     asyncio.create_task(scheduled_stale_channel_detector_loop())
+    asyncio.create_task(scheduled_session_watchdog_loop())
     print("Bot is up and operational.")
 
 
