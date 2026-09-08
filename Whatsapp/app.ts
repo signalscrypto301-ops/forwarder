@@ -936,12 +936,9 @@ function buildMediaPayload(filePath: string, originalName: string | undefined, c
             mimetype: mimeType,
         };
     } else if (mimeType.startsWith("video/")) {
-        return {
-            video: buffer,
-            caption: caption || undefined,
-            mimetype: mimeType,
-        };
+        throw new Error("Video forwarding is banned");
     } else if (mimeType.startsWith("audio/")) {
+
         const isVoice = mimeType.includes("ogg") || mimeType.includes("opus") || (originalName && originalName.endsWith(".ogg"));
         return {
             audio: buffer,
@@ -987,9 +984,16 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
 
         const jid = formatJid(groupId);
         if (file) {
+            const mimeType = (mime.lookup(file.originalname || file.path) || file.mimetype || "") as string;
+            const isVideoExt = /\.(mp4|mov|avi|mkv|webm|flv|wmv|m4v|3gp|ts|m4p|mpg|mpeg)$/i.test(file.originalname || file.path);
+            if (mimeType.startsWith("video/") || isVideoExt) {
+                console.warn(`[${targetId}] 🚫 Video forwarding is banned. Rejected: ${file.originalname}`);
+                return res.status(403).json({ message: "Video forwarding is banned" });
+            }
             const payload = buildMediaPayload(file.path, file.originalname, caption);
             await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
         } else if (caption) {
+
             await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, { text: String(caption) }));
         } else {
             return res.status(400).json({ message: "No media or caption provided" });
@@ -1061,7 +1065,15 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
             return res.status(400).json({ message: "No media file provided" });
         }
 
+        const mimeType = (mime.lookup(file.originalname || file.path) || file.mimetype || "") as string;
+        const isVideoExt = /\.(mp4|mov|avi|mkv|webm|flv|wmv|m4v|3gp|ts|m4p|mpg|mpeg)$/i.test(file.originalname || file.path);
+        if (mimeType.startsWith("video/") || isVideoExt) {
+            console.warn(`[${targetId}] 🚫 Video forwarding is banned. Rejected: ${file.originalname}`);
+            return res.status(403).json({ message: "Video forwarding is banned" });
+        }
+
         const jid = formatJid(groupId);
+
         const payload = buildMediaPayload(file.path, file.originalname, caption);
         await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
 

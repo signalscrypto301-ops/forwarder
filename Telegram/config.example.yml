@@ -5,6 +5,8 @@ settings:
   API_ID: 12345678
   API_HASH: "your_telethon_api_hash"
   api_secret: "change_this_to_a_secure_random_secret_token"
+  ban_video_forwarding: true  # Completely ban forwarding of videos (pure videos, video captions, video notes, video docs)
+
 
 rate_limits:
   max_per_hour: 120

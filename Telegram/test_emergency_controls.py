@@ -43,7 +43,11 @@ class TestEmergencyControls(unittest.TestCase):
         self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.temp_db.close()
         database.DB_PATH = self.temp_db.name
+        bot.InlineKeyboardMarkup = MockInlineKeyboardMarkup
+        bot.InlineKeyboardButton = MockInlineKeyboardButton
         database.create_table()
+
+
 
     def tearDown(self):
         if os.path.exists(self.temp_db.name):

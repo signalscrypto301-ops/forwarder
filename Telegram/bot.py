@@ -1874,7 +1874,15 @@ async def retry_all_failed_messages() -> tuple[int, int]:
         original_filename = item.get("original_filename")
         media_path = item.get("media_path")
 
+        # Optimization / Policy: Skip videos if video forwarding is banned
+        if getattr(config, "BAN_VIDEO_FORWARDING", True) and content_type == "video":
+            logger.info(
+                f"🚫 [Video Ban] Skipping DLQ retry for video item {item_id} (video forwarding is banned)."
+            )
+            continue
+
         # If it was a size limit rejection or media was not preserved, we cannot re-send media without the file
+
         if content_type != "text" and (not media_path or not os.path.exists(media_path)):
             logger.warning(
                 f"DLQ item {item_id} ({content_type}) cannot be retried: media file not available."
@@ -2090,7 +2098,18 @@ async def send_to_single_group(
     - Persistent aiohttp connection pooling
     - Detailed error diagnostic logging
     """
+    if getattr(config, "BAN_VIDEO_FORWARDING", True):
+        if content_type == "video" or (
+            downloaded_media
+            and any(downloaded_media.lower().endswith(ext) for ext in VIDEO_EXTENSIONS)
+        ):
+            logger.info(
+                f"🚫 [Video Ban] Refusing to forward video message ({content_type}) to group {group}."
+            )
+            return False
+
     rate_controller.enter_queue()
+
     try:
         async with UPLOAD_SEMAPHORE:
             # 1. Per-recipient Token Bucket rate limiting
@@ -2383,6 +2402,61 @@ async def send_to_single_group(
 
 
 
+# ---------- Video Forwarding Policy (Banning All Video Messages) ----------
+
+VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm",
+    ".flv",
+    ".wmv",
+    ".m4v",
+    ".3gp",
+    ".ts",
+    ".m4p",
+    ".mpg",
+    ".mpeg",
+}
+
+
+def is_video_message(message: types.Message) -> bool:
+    """
+    Checks if a Telegram message is a video or has video attached.
+    Identifies:
+    1. Standalone video messages (ContentType.VIDEO without caption)
+    2. Video messages with text/caption attached (ContentType.VIDEO with caption)
+    3. Video round notes (ContentType.VIDEO_NOTE)
+    4. Video animations / GIFs (ContentType.ANIMATION)
+    5. Document messages containing video files (video/* MIME or video file extension)
+    """
+    if getattr(message, "video", None) is not None:
+        return True
+    if getattr(message, "content_type", None) == ContentType.VIDEO:
+        return True
+    if getattr(message, "video_note", None) is not None:
+        return True
+    if getattr(message, "content_type", None) == getattr(ContentType, "VIDEO_NOTE", "video_note"):
+        return True
+    if getattr(message, "animation", None) is not None:
+        return True
+    if getattr(message, "content_type", None) == getattr(ContentType, "ANIMATION", "animation"):
+        return True
+
+    doc = getattr(message, "document", None)
+    if doc:
+        mime = (getattr(doc, "mime_type", "") or "").lower()
+        if mime.startswith("video/"):
+            return True
+        fname = (getattr(doc, "file_name", "") or "").lower()
+        ext = os.path.splitext(fname)[1]
+        if ext in VIDEO_EXTENSIONS:
+            return True
+
+    return False
+
+
 # ---------- Channel Post Handler (Fix 2.1, 2.4, 2.6, 3.3) ----------
 
 
@@ -2391,6 +2465,8 @@ async def send_to_single_group(
         ContentType.TEXT,
         ContentType.PHOTO,
         ContentType.VIDEO,
+        getattr(ContentType, "VIDEO_NOTE", "video_note"),
+        getattr(ContentType, "ANIMATION", "animation"),
         ContentType.DOCUMENT,
         ContentType.VOICE,
         ContentType.AUDIO,
@@ -2399,8 +2475,16 @@ async def send_to_single_group(
 async def handle_channel_post(message: types.Message):
     channel_id = clean_id(message.chat.id)
 
+    # Ban video forwarding: if any message has video attached or is pure video, do not forward
+    if getattr(config, "BAN_VIDEO_FORWARDING", True) and is_video_message(message):
+        logger.info(
+            f"🚫 [Video Ban] Message {getattr(message, 'message_id', 'unknown')} in channel {channel_id} contains video (type={getattr(message, 'content_type', 'unknown')}). Forwarding is banned. Dropping post."
+        )
+        return
+
     # Record channel activity timestamp (Optimization 3.B: Stale Channel Detector)
     await asyncio.to_thread(update_channel_last_post, channel_id)
+
 
     # Record channel hourly post volume (Optimization 6.A: Audience & Channel Intelligence)
     await asyncio.to_thread(record_channel_post_activity, channel_id)
@@ -2466,8 +2550,14 @@ async def handle_channel_post(message: types.Message):
                 if os.path.exists(photo_path):
                     os.remove(photo_path)
 
-        # 3. Process Videos with Pre-Download Size Guard (Fix 2.4)
+        # 3. Process Videos (Banned when BAN_VIDEO_FORWARDING is True)
         elif message.content_type == ContentType.VIDEO:
+            if getattr(config, "BAN_VIDEO_FORWARDING", True):
+                logger.info(
+                    f"🚫 [Video Ban] Video message in channel {channel_id} dropped (video forwarding is banned)."
+                )
+                return
+
             raw_caption = message.caption or ""
             entities = message.caption_entities or []
             allow_caption = await should_forward_caption(
@@ -2545,6 +2635,17 @@ async def handle_channel_post(message: types.Message):
 
         # 4. Process Documents with Pre-Download Size Guard (Fix 2.4)
         elif message.content_type == ContentType.DOCUMENT:
+            doc = message.document
+            if getattr(config, "BAN_VIDEO_FORWARDING", True) and doc:
+                mime = (getattr(doc, "mime_type", "") or "").lower()
+                fname = (getattr(doc, "file_name", "") or "").lower()
+                ext = os.path.splitext(fname)[1]
+                if mime.startswith("video/") or ext in VIDEO_EXTENSIONS:
+                    logger.info(
+                        f"🚫 [Video Ban] Document '{fname}' ({mime}) in channel {channel_id} is a video. Video forwarding is banned. Skipping."
+                    )
+                    return
+
             raw_caption = message.caption or ""
             entities = message.caption_entities or []
             allow_caption = await should_forward_caption(

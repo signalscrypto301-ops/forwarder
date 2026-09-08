@@ -14,8 +14,16 @@ file_handler = RotatingFileHandler(
 file_handler.setLevel(logging.DEBUG)
 file_handler.setFormatter(formatter)
 
+# Ensure stdout supports UTF-8 on Windows
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # Console handler for Docker / terminal visibility
 console_handler = logging.StreamHandler(sys.stdout)
+
 console_handler.setLevel(logging.INFO)
 console_handler.setFormatter(formatter)
 

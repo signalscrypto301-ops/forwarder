@@ -52,4 +52,10 @@ PER_RECIPIENT_RATE = float(
 PER_RECIPIENT_BURST = int(
     os.getenv("PER_RECIPIENT_BURST") or rate_limits.get("per_recipient_burst", 3)
 )
+
+# Video Forwarding Policy: True = completely ban video forwarding
+BAN_VIDEO_FORWARDING = os.getenv(
+    "BAN_VIDEO_FORWARDING", str(settings.get("ban_video_forwarding", True))
+).strip().lower() in ("true", "1", "yes")
+
 
