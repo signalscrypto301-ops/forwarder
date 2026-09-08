@@ -2723,9 +2723,6 @@ async def handle_channel_post(message: types.Message):
             try:
                 await photo.download(destination_file=photo_path)
                 if os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
-                    photo_path = await asyncio.to_thread(
-                        adapt_image_for_whatsapp_channel, photo_path
-                    )
                     downloaded_media = photo_path
                 else:
                     logger.error(f"Downloaded photo {photo_path} is missing or empty.")
