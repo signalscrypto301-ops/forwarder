@@ -70,6 +70,78 @@ function formatJid(rawId: string): string {
     return `${clean}@s.whatsapp.net`;
 }
 
+// ---------- Newsletter & MEX Support ----------
+let executeWMexQueryFn: any = null;
+try {
+    const mex = require("@whiskeysockets/baileys/lib/Socket/mex.js");
+    executeWMexQueryFn = mex.executeWMexQuery;
+} catch (e) {
+    console.warn("Notice: mex.executeWMexQuery loader:", e);
+}
+
+interface KnownNewsletter {
+    id: string;
+    name: string;
+    subscribersCount?: number;
+    updatedAt: number;
+}
+
+const KNOWN_NEWSLETTERS_FILE = path.resolve(".baileys_auth", "known_newsletters.json");
+const knownNewslettersMap = new Map<string, KnownNewsletter>();
+
+function loadKnownNewsletters() {
+    try {
+        if (fs.existsSync(KNOWN_NEWSLETTERS_FILE)) {
+            const raw = fs.readFileSync(KNOWN_NEWSLETTERS_FILE, "utf-8");
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+                for (const item of arr) {
+                    if (item && item.id) {
+                        knownNewslettersMap.set(item.id, item);
+                    }
+                }
+                console.log(`[Newsletters] Loaded ${knownNewslettersMap.size} known newsletters from disk.`);
+            }
+        }
+    } catch (e) {
+        console.warn("Error reading known_newsletters.json:", e);
+    }
+}
+
+function saveKnownNewsletters() {
+    try {
+        const dir = path.dirname(KNOWN_NEWSLETTERS_FILE);
+        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+        const list = Array.from(knownNewslettersMap.values());
+        fs.writeFileSync(KNOWN_NEWSLETTERS_FILE, JSON.stringify(list, null, 2), "utf-8");
+    } catch (e) {
+        console.warn("Error writing known_newsletters.json:", e);
+    }
+}
+
+function registerKnownNewsletter(id: string, name?: string, count?: number) {
+    if (!id) return;
+    let cleanId = String(id).trim();
+    if (/^\d{15,}$/.test(cleanId)) {
+        cleanId = `${cleanId}@newsletter`;
+    }
+    if (!cleanId.endsWith("@newsletter")) return;
+
+    const existing = knownNewslettersMap.get(cleanId);
+    const validName = (name && name.trim() && name.trim() !== cleanId) ? name.trim() : (existing?.name || cleanId);
+    const validCount = typeof count === "number" && count > 0 ? count : existing?.subscribersCount;
+
+    knownNewslettersMap.set(cleanId, {
+        id: cleanId,
+        name: validName,
+        subscribersCount: validCount,
+        updatedAt: Date.now(),
+    });
+    saveKnownNewsletters();
+}
+
+loadKnownNewsletters();
+
 // Setup multer for media upload with sanitization and size limits
 const storage = multer.diskStorage({
     destination: "uploads/",
@@ -265,13 +337,37 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
     });
 
     sock.ev.on("messages.upsert", (m) => {
-        if (entry.isListening && m.messages) {
+        if (m.messages) {
             for (const msg of m.messages) {
-                if (!msg.key.fromMe) {
+                const jid = msg.key?.remoteJid;
+                if (jid && jid.endsWith("@newsletter")) {
+                    registerKnownNewsletter(jid);
+                }
+                if (entry.isListening && !msg.key.fromMe) {
                     const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text;
                     if (text) {
                         console.log(`[${safeId}] Incoming message: ${text.slice(0, 100)}`);
                     }
+                }
+            }
+        }
+    });
+
+    sock.ev.on("chats.upsert" as any, (chats: any[]) => {
+        if (Array.isArray(chats)) {
+            for (const c of chats) {
+                if (c && c.id && c.id.endsWith("@newsletter")) {
+                    registerKnownNewsletter(c.id, c.name || c.subject);
+                }
+            }
+        }
+    });
+
+    sock.ev.on("messaging-history.set" as any, ({ chats }: any) => {
+        if (Array.isArray(chats)) {
+            for (const c of chats) {
+                if (c && c.id && c.id.endsWith("@newsletter")) {
+                    registerKnownNewsletter(c.id, c.name || c.subject);
                 }
             }
         }
@@ -385,78 +481,6 @@ app.post("/startlistening", async (req, res) => {
     res.json({ message: "Listening to messages" });
 });
 
-app.post("/getChatId", async (req, res) => {
-    const targetId = sanitizeClientId(req.body.clientId || clientId);
-    const { chatName } = req.body;
-
-    if (!chatName) {
-        return res.status(400).json({ message: "chatName is required" });
-    }
-
-    const entry = sessions[targetId];
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({ message: "Session is not authorized" });
-    }
-
-    try {
-        const sock = entry.sock;
-        const searchName = String(chatName).trim();
-        const searchLower = searchName.toLowerCase();
-
-        // 1. Check if input is already a direct JID
-        if (searchName.endsWith("@g.us") || searchName.endsWith("@newsletter") || searchName.endsWith("@s.whatsapp.net")) {
-            return res.json({
-                groupId: searchName,
-                name: searchName,
-                isGroup: searchName.endsWith("@g.us"),
-                isChannel: searchName.endsWith("@newsletter"),
-            });
-        }
-
-        // 2. Search participating groups
-        const groups = await sock.groupFetchAllParticipating();
-        for (const [id, meta] of Object.entries(groups)) {
-            if (meta.subject && meta.subject.trim().toLowerCase() === searchLower) {
-                return res.json({
-                    groupId: id,
-                    name: meta.subject,
-                    isGroup: true,
-                });
-            }
-        }
-
-        // 3. Search newsletters if supported
-        if (typeof (sock as any).newsletterSubscribed === "function") {
-            try {
-                const newsletters = await (sock as any).newsletterSubscribed();
-                if (Array.isArray(newsletters)) {
-                    for (const nl of newsletters) {
-                        const name = nl?.thread_metadata?.name?.text || nl?.name;
-                        const id = nl?.id || nl?.jid;
-                        if (name && id && name.trim().toLowerCase() === searchLower) {
-                            return res.json({
-                                groupId: id,
-                                name: name,
-                                isChannel: true,
-                            });
-                        }
-                    }
-                }
-            } catch (nlErr) {
-                console.warn(`[${targetId}] Newsletter fetch warning:`, nlErr);
-            }
-        }
-
-        return res.status(404).json({ message: "Group or channel not found" });
-    } catch (error: any) {
-        console.error(`[${targetId}] Error in getChatId:`, error);
-        res.status(500).json({
-            message: "Internal server error",
-            error: error?.message || String(error),
-        });
-    }
-});
-
 interface ChatItem {
     id: string;
     name: string;
@@ -470,6 +494,75 @@ interface ChatCacheEntry {
 }
 
 const chatDiscoveryCache: Record<string, ChatCacheEntry> = {};
+
+async function fetchSubscribedNewsletters(sock: any, targetId: string): Promise<ChatItem[]> {
+    const list: ChatItem[] = [];
+    const seenIds = new Set<string>();
+
+    // 1. Try MEX xwa2_newsletter_subscribed via Baileys executeWMexQuery
+    if (executeWMexQueryFn && typeof sock.query === "function" && typeof sock.generateMessageTag === "function") {
+        try {
+            const res = await executeWMexQueryFn(
+                {},
+                "6388546374527196",
+                "xwa2_newsletter_subscribed",
+                sock.query,
+                sock.generateMessageTag
+            );
+            if (Array.isArray(res)) {
+                for (const nl of res) {
+                    const id = nl?.id || nl?.jid;
+                    if (id && !seenIds.has(id)) {
+                        seenIds.add(id);
+                        const name = nl?.thread_metadata?.name?.text || nl?.name || nl?.thread_metadata?.name || id;
+                        const count = parseInt(nl?.thread_metadata?.subscribers_count || nl?.subscribers || "0", 10);
+                        const item: ChatItem = {
+                            id,
+                            name: String(name || id),
+                            type: "newsletter",
+                            participantsCount: count || undefined,
+                        };
+                        list.push(item);
+                        registerKnownNewsletter(id, item.name, item.participantsCount);
+                    }
+                }
+            }
+        } catch (mexErr: any) {
+            console.warn(`[${targetId}] MEX xwa2_newsletter_subscribed notice:`, mexErr?.message || mexErr);
+        }
+    }
+
+    // 2. Also merge all known/persisted newsletters from disk
+    for (const [id, item] of knownNewslettersMap.entries()) {
+        if (!seenIds.has(id)) {
+            seenIds.add(id);
+            list.push({
+                id,
+                name: item.name || id,
+                type: "newsletter",
+                participantsCount: item.subscribersCount,
+            });
+        }
+    }
+
+    // 3. For any newsletter whose name is unknown or matches JID, resolve via sock.newsletterMetadata
+    for (const item of list) {
+        if ((!item.name || item.name === item.id) && typeof (sock as any).newsletterMetadata === "function") {
+            try {
+                const meta = await (sock as any).newsletterMetadata("jid", item.id);
+                if (meta) {
+                    const resolvedName = meta.name || (meta as any).thread_metadata?.name?.text;
+                    if (resolvedName) {
+                        item.name = resolvedName;
+                        registerKnownNewsletter(item.id, resolvedName, meta.subscribers);
+                    }
+                }
+            } catch (_) {}
+        }
+    }
+
+    return list;
+}
 
 async function discoverChats(entry: SessionEntry, targetId: string): Promise<ChatItem[]> {
     const now = Date.now();
@@ -496,27 +589,16 @@ async function discoverChats(entry: SessionEntry, targetId: string): Promise<Cha
         console.warn(`[${targetId}] Error fetching groups:`, grpErr);
     }
 
-    // 2. Fetch subscribed newsletters / channels
-    if (typeof (sock as any).newsletterSubscribed === "function") {
-        try {
-            const newsletters = await (sock as any).newsletterSubscribed();
-            if (Array.isArray(newsletters)) {
-                for (const nl of newsletters) {
-                    const name = nl?.thread_metadata?.name?.text || nl?.name || nl?.id;
-                    const id = nl?.id || nl?.jid;
-                    if (id) {
-                        chats.push({
-                            id,
-                            name: name || id,
-                            type: "newsletter",
-                            participantsCount: nl?.thread_metadata?.subscribers_count,
-                        });
-                    }
-                }
+    // 2. Fetch subscribed and known newsletters / channels
+    try {
+        const newsletters = await fetchSubscribedNewsletters(sock, targetId);
+        for (const nl of newsletters) {
+            if (!chats.some((c) => c.id === nl.id)) {
+                chats.push(nl);
             }
-        } catch (nlErr) {
-            console.warn(`[${targetId}] Error fetching newsletters:`, nlErr);
         }
+    } catch (nlErr) {
+        console.warn(`[${targetId}] Error fetching newsletters:`, nlErr);
     }
 
     chats.sort((a, b) => a.name.localeCompare(b.name, undefined, { sensitivity: "base" }));
@@ -528,6 +610,196 @@ async function discoverChats(entry: SessionEntry, targetId: string): Promise<Cha
 
     return chats;
 }
+
+app.post("/registerNewsletters", (req, res) => {
+    const { newsletters } = req.body;
+    if (Array.isArray(newsletters)) {
+        for (const item of newsletters) {
+            const id = typeof item === "string" ? item : item?.id;
+            const name = typeof item === "object" ? item?.name : undefined;
+            if (id) {
+                registerKnownNewsletter(id, name);
+            }
+        }
+    }
+    res.json({ message: "Registered", count: knownNewslettersMap.size });
+});
+
+app.post("/getChatId", async (req, res) => {
+    const targetId = sanitizeClientId(req.body.clientId || clientId);
+    const { chatName } = req.body;
+
+    if (!chatName) {
+        return res.status(400).json({ message: "chatName is required" });
+    }
+
+    const entry = sessions[targetId];
+    if (!(entry && entry.isReady && entry.sock)) {
+        return res.status(400).json({ message: "Session is not authorized" });
+    }
+
+    try {
+        const sock = entry.sock;
+        const rawInput = String(chatName).trim();
+        // Clean wrapping brackets e.g. <FOREX>, quotes "FOREX", backticks `FOREX`
+        const cleanQuery = rawInput.replace(/^[<"'`\s]+|[>"'`\s]+$/g, "").trim();
+        const searchLower = cleanQuery.toLowerCase();
+
+        // 1. Direct JID check (e.g. 120363...@newsletter, 120363...@g.us)
+        if (cleanQuery.endsWith("@g.us") || cleanQuery.endsWith("@newsletter") || cleanQuery.endsWith("@s.whatsapp.net")) {
+            let name = cleanQuery;
+            if (cleanQuery.endsWith("@newsletter") && typeof (sock as any).newsletterMetadata === "function") {
+                try {
+                    const meta = await (sock as any).newsletterMetadata("jid", cleanQuery);
+                    if (meta) {
+                        name = meta.name || (meta as any).thread_metadata?.name?.text || name;
+                        registerKnownNewsletter(cleanQuery, name, meta.subscribers);
+                    }
+                } catch (_) {}
+            }
+            return res.json({
+                groupId: cleanQuery,
+                name,
+                isGroup: cleanQuery.endsWith("@g.us"),
+                isChannel: cleanQuery.endsWith("@newsletter"),
+            });
+        }
+
+        // 2. Direct pure digit JID check (e.g. 120363420111598085)
+        if (/^\d{15,}$/.test(cleanQuery)) {
+            const asNl = `${cleanQuery}@newsletter`;
+            const asGrp = `${cleanQuery}@g.us`;
+            if (knownNewslettersMap.has(asNl)) {
+                const kn = knownNewslettersMap.get(asNl)!;
+                return res.json({
+                    groupId: asNl,
+                    name: kn.name || asNl,
+                    isChannel: true,
+                    isGroup: false,
+                });
+            }
+            if (typeof (sock as any).newsletterMetadata === "function") {
+                try {
+                    const meta = await (sock as any).newsletterMetadata("jid", asNl);
+                    if (meta && meta.id) {
+                        const name = meta.name || (meta as any).thread_metadata?.name?.text || asNl;
+                        registerKnownNewsletter(asNl, name, meta.subscribers);
+                        return res.json({
+                            groupId: asNl,
+                            name,
+                            isChannel: true,
+                            isGroup: false,
+                        });
+                    }
+                } catch (_) {}
+            }
+        }
+
+        // 3. WhatsApp Channel Invite Link check (e.g. https://whatsapp.com/channel/0029VaXXXXX or whatsapp.com/channel/CODE)
+        const channelLinkMatch = cleanQuery.match(/(?:whatsapp\.com\/channel\/|^)([a-zA-Z0-9_-]{15,30})$/i);
+        if (channelLinkMatch && typeof (sock as any).newsletterMetadata === "function") {
+            const inviteCode = channelLinkMatch[1];
+            try {
+                const meta = await (sock as any).newsletterMetadata("invite", inviteCode);
+                if (meta && meta.id) {
+                    const name = meta.name || (meta as any).thread_metadata?.name?.text || meta.id;
+                    registerKnownNewsletter(meta.id, name, meta.subscribers);
+                    return res.json({
+                        groupId: meta.id,
+                        name,
+                        isChannel: true,
+                        isGroup: false,
+                        subscribers: meta.subscribers,
+                    });
+                }
+            } catch (invErr: any) {
+                console.warn(`[${targetId}] Newsletter invite resolution notice:`, invErr?.message || invErr);
+            }
+        }
+
+        // 4. Fetch all participating groups and newsletters
+        const allChats = await discoverChats(entry, targetId);
+
+        // 5. Intelligent Ranking / Fuzzy Matching:
+        const queryWords = searchLower.split(/\s+/).filter(Boolean);
+
+        interface ScoredMatch {
+            chat: ChatItem;
+            score: number;
+        }
+
+        const scored: ScoredMatch[] = [];
+
+        for (const chat of allChats) {
+            const nameLower = (chat.name || "").toLowerCase().trim();
+            const idLower = (chat.id || "").toLowerCase().trim();
+
+            let score = 0;
+            if (nameLower === searchLower || idLower === searchLower) {
+                score = 100; // Exact match
+            } else if (nameLower.startsWith(searchLower)) {
+                score = 80;  // Prefix match
+            } else if (nameLower.includes(searchLower)) {
+                score = 60;  // Substring match
+            } else if (queryWords.length > 1 && queryWords.every((w) => nameLower.includes(w))) {
+                score = 50;  // All words present (e.g. "bitcoin forex" in "bitcoin crypto forex gold")
+            } else if (queryWords.some((w) => nameLower.includes(w) && w.length >= 3)) {
+                const matchingWords = queryWords.filter((w) => nameLower.includes(w) && w.length >= 3);
+                score = 20 + (matchingWords.length / queryWords.length) * 20;
+            }
+
+            if (score > 0) {
+                scored.push({ chat, score });
+            }
+        }
+
+        scored.sort((a, b) => b.score - a.score);
+
+        if (scored.length > 0) {
+            const best = scored[0].chat;
+            const matches = scored.slice(0, 5).map((s) => ({
+                groupId: s.chat.id,
+                name: s.chat.name,
+                isChannel: s.chat.type === "newsletter",
+                isGroup: s.chat.type === "group",
+            }));
+
+            return res.json({
+                groupId: best.id,
+                name: best.name,
+                isGroup: best.type === "group",
+                isChannel: best.type === "newsletter",
+                matches: matches.length > 1 ? matches : undefined,
+            });
+        }
+
+        // 6. Last resort: Try as an invite code if alphanumeric and reasonable length
+        if (/^[a-zA-Z0-9_-]{15,30}$/.test(cleanQuery) && typeof (sock as any).newsletterMetadata === "function") {
+            try {
+                const meta = await (sock as any).newsletterMetadata("invite", cleanQuery);
+                if (meta && meta.id) {
+                    const name = meta.name || (meta as any).thread_metadata?.name?.text || meta.id;
+                    registerKnownNewsletter(meta.id, name, meta.subscribers);
+                    return res.json({
+                        groupId: meta.id,
+                        name,
+                        isChannel: true,
+                        isGroup: false,
+                        subscribers: meta.subscribers,
+                    });
+                }
+            } catch (_) {}
+        }
+
+        return res.status(404).json({ message: `Group or channel not found for "${cleanQuery}"` });
+    } catch (error: any) {
+        console.error(`[${targetId}] Error in getChatId:`, error);
+        res.status(500).json({
+            message: "Internal server error",
+            error: error?.message || String(error),
+        });
+    }
+});
 
 app.get("/groups", async (req, res) => {
     const targetId = sanitizeClientId((req.query.clientId as string) || clientId);
@@ -723,6 +995,10 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
             return res.status(400).json({ message: "No media or caption provided" });
         }
 
+        if (jid.endsWith("@newsletter")) {
+            registerKnownNewsletter(jid);
+        }
+
         res.json({ message: "Message sent successfully" });
     } catch (error: any) {
         console.error(`[${targetId}] Error sending message:`, error);
@@ -757,6 +1033,9 @@ app.post("/sendText", async (req, res) => {
     try {
         const jid = formatJid(groupId);
         await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, { text: String(text) }));
+        if (jid.endsWith("@newsletter")) {
+            registerKnownNewsletter(jid);
+        }
         res.json({ message: "Text message sent successfully" });
     } catch (error: any) {
         console.error(`[${targetId}] Error sending text message:`, error);
@@ -785,6 +1064,10 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
         const jid = formatJid(groupId);
         const payload = buildMediaPayload(file.path, file.originalname, caption);
         await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
+
+        if (jid.endsWith("@newsletter")) {
+            registerKnownNewsletter(jid);
+        }
 
         res.json({ message: "Media message sent successfully" });
     } catch (error: any) {

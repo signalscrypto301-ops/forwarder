@@ -966,25 +966,59 @@ async def get_chat_id_command(message: Message):
 
     args = message.get_args()
     if not args:
-        await message.reply("Please provide a group or channel name.")
+        await message.reply(
+            "Please provide a group or channel name, link, or JID.\n\n"
+            "<b>Examples:</b>\n"
+            "• <code>/get_chat_id FOREX</code>\n"
+            "• <code>/get_chat_id Bitcoin crypto Forex gold & Stock traders</code>\n"
+            "• <code>/get_chat_id https://whatsapp.com/channel/0029Va...</code>",
+            parse_mode=ParseMode.HTML,
+        )
         return
 
+    clean_query = args.strip().strip("<>\"'`")
     data = {
-        "chatName": args.strip(),
+        "chatName": clean_query,
         "clientId": "user",
     }
 
     try:
         status_code, res_data = await post_whatsapp_json("getChatId", data, timeout_sec=30)
         if status_code == 200:
-            kind = "Channel / Newsletter" if res_data.get("isChannel") else "Group / Chat"
-            await message.reply(
-                f"<b>{kind} Found:</b>\nName: <code>{res_data.get('name', args)}</code>\nID: <code>{res_data.get('groupId')}</code>",
-                parse_mode=ParseMode.HTML,
-            )
+            matches = res_data.get("matches")
+            if matches and len(matches) > 1:
+                lines = [f"🔍 <b>Found {len(matches)} matching chats for \"{clean_query}\":</b>\n"]
+                for i, m in enumerate(matches, 1):
+                    icon = "📢" if m.get("isChannel") else "👥"
+                    kind = "Channel" if m.get("isChannel") else "Group"
+                    lines.append(
+                        f"{i}. {icon} <b>{m.get('name')}</b> ({kind})\n"
+                        f"   ID: <code>{m.get('groupId')}</code>\n"
+                    )
+                lines.append("💡 <i>Tap any ID above to copy, then map it with:</i>")
+                lines.append("<code>/add_group &lt;channel_id&gt; &lt;group_id&gt;</code>")
+                await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
+            else:
+                kind = "Channel / Newsletter" if res_data.get("isChannel") else "Group / Chat"
+                icon = "📢" if res_data.get("isChannel") else "👥"
+                await message.reply(
+                    f"{icon} <b>{kind} Found:</b>\n"
+                    f"Name: <b>{res_data.get('name', clean_query)}</b>\n"
+                    f"ID: <code>{res_data.get('groupId')}</code>\n\n"
+                    f"💡 <i>To map this to a channel, use:</i>\n"
+                    f"<code>/add_group &lt;channel_id&gt; {res_data.get('groupId')}</code>",
+                    parse_mode=ParseMode.HTML,
+                )
         elif status_code in (400, 404):
+            err_msg = res_data.get("message", "Group or channel not found")
             await message.reply(
-                f"❌ {res_data.get('message')}", parse_mode=ParseMode.HTML
+                f"❌ <b>{err_msg}</b>\n\n"
+                f"💡 <b>Tips to find your WhatsApp channel:</b>\n"
+                f"• Try a shorter keyword: e.g. <code>/get_chat_id FOREX</code> or <code>/get_chat_id Bitcoin</code>\n"
+                f"• Paste the channel link directly: <code>/get_chat_id https://whatsapp.com/channel/...</code>\n"
+                f"• Use the interactive wizard: /map\n"
+                f"• Make sure your WhatsApp account is an admin or follower of the channel.",
+                parse_mode=ParseMode.HTML,
             )
         else:
             err_detail = res_data.get("error", res_data.get("message", "Unknown error"))
@@ -1086,6 +1120,10 @@ async def add_group_command(message: Message):
 
     channel_id, group_id = args.split()
     await asyncio.to_thread(add_group_for_channel, channel_id, group_id)
+    if "@newsletter" in group_id:
+        asyncio.create_task(
+            post_whatsapp_json("registerNewsletters", {"newsletters": [group_id]}, timeout_sec=5)
+        )
     await message.reply(
         f"✅ Group <code>{group_id}</code> mapped to channel <code>{clean_id(channel_id)}</code>.",
         parse_mode=ParseMode.HTML,
@@ -2979,6 +3017,26 @@ async def periodic_cleanup_task():
             logger.error(f"Error in periodic cleanup task: {e}")
 
 
+async def sync_database_newsletters_to_whatsapp():
+    """
+    Scans all mapped groups in SQLite database and registers any newsletters/groups
+    with the WhatsApp microservice so they are instantly discoverable via /get_chat_id and /map.
+    """
+    try:
+        channels = await asyncio.to_thread(get_all_channels)
+        all_jids = set()
+        for ch in channels:
+            groups = await asyncio.to_thread(get_groups_for_channel, ch)
+            for g in groups:
+                if g and ("@newsletter" in g or "@g.us" in g or len(g) > 15):
+                    all_jids.add(g)
+        if all_jids:
+            logger.info(f"Syncing {len(all_jids)} database destinations to WhatsApp service...")
+            await post_whatsapp_json("registerNewsletters", {"newsletters": list(all_jids)}, timeout_sec=15)
+    except Exception as e:
+        logger.debug(f"sync_database_newsletters_to_whatsapp notice: {e}")
+
+
 async def on_startup(_):
     logger.info("Bot starting up...")
     cleanup_stale_media()
@@ -2987,6 +3045,7 @@ async def on_startup(_):
     asyncio.create_task(scheduled_daily_report_loop())
     asyncio.create_task(scheduled_stale_channel_detector_loop())
     asyncio.create_task(scheduled_session_watchdog_loop())
+    asyncio.create_task(sync_database_newsletters_to_whatsapp())
     print("Bot is up and operational.")
 
 
