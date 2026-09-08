@@ -5,7 +5,9 @@ import asyncio
 import random
 import time
 import io
+import re
 from datetime import datetime, timedelta
+from PIL import Image, ImageFilter, ImageEnhance, ImageStat
 
 try:
     import aiohttp
@@ -1976,16 +1978,155 @@ async def add_channel_command(message: Message):
     )
 
 
-# ---------- Entity & Caption Formatting (Fix 2.1 & 3.5) ----------
+# ---------- Image Aspect-Ratio & Quality Adapter for WhatsApp Channels ----------
+
+
+def adapt_image_for_whatsapp_channel(image_path: str) -> str:
+    """
+    Adapts images for optimal presentation in WhatsApp Channels (Newsletters).
+
+    WhatsApp Channel feed cards on mobile render in a near-square (~1:1) container
+    with AspectFill/centerCrop. Wide landscape banners (aspect ratio > 1.20) or extremely
+    tall screenshots (aspect ratio < 0.75) have their outer edges severely cropped,
+    cutting off logos, badges, and text.
+
+    This function intelligently adapts the canvas:
+    - Landscape (ratio > 1.20): Pads vertically to a 1:1 square canvas (w x w).
+      * If edge pixels are solid/uniform (e.g. black, white, dark navy), pads with matching color.
+      * If edge pixels are varied/scenic, pads with a sophisticated Gaussian-blurred background.
+    - Extreme Portrait (ratio < 0.75): Pads horizontally to a 4:5 ratio canvas.
+    - Standard ratios (0.75 to 1.20): Untouched.
+    """
+    if not image_path or not os.path.exists(image_path):
+        return image_path
+
+    try:
+        with Image.open(image_path) as raw_img:
+            # Convert to RGB if needed (handles RGBA, P, etc.)
+            if raw_img.mode in ("RGBA", "LA"):
+                bg = Image.new("RGB", raw_img.size, (0, 0, 0))
+                mask = raw_img.split()[-1]
+                bg.paste(raw_img, mask=mask)
+                img = bg
+            elif raw_img.mode != "RGB":
+                img = raw_img.convert("RGB")
+            else:
+                img = raw_img.copy()
+
+        w, h = img.size
+        if w <= 0 or h <= 0:
+            return image_path
+
+        ratio = w / h
+
+        # If already well-proportioned for WhatsApp feed cards (0.75 to 1.20), leave untouched
+        if 0.75 <= ratio <= 1.20:
+            return image_path
+
+        if ratio > 1.20:
+            # Landscape banner: Pad vertically to 1:1 square
+            target_w = w
+            target_h = w
+            paste_x = 0
+            paste_y = (target_h - h) // 2
+
+            # Sample top and bottom edge strips to detect background color
+            sample_h = max(1, min(8, h // 4))
+            top_strip = img.crop((0, 0, w, sample_h))
+            bottom_strip = img.crop((0, max(0, h - sample_h), w, h))
+
+            stat_top = ImageStat.Stat(top_strip)
+            stat_bottom = ImageStat.Stat(bottom_strip)
+
+            top_std = max(stat_top.stddev[:3]) if len(stat_top.stddev) >= 3 else 0
+            bottom_std = max(stat_bottom.stddev[:3]) if len(stat_bottom.stddev) >= 3 else 0
+
+            avg_top = stat_top.mean[:3]
+            avg_bot = stat_bottom.mean[:3]
+            is_dark = max(avg_top) < 35 and max(avg_bot) < 35
+            is_bright = min(avg_top) > 220 and min(avg_bot) > 220
+
+            if is_dark:
+                canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+            elif is_bright:
+                canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+            elif top_std < 22 and bottom_std < 22:
+                # Solid uniform color
+                r = int((avg_top[0] + avg_bot[0]) / 2)
+                g = int((avg_top[1] + avg_bot[1]) / 2)
+                b = int((avg_top[2] + avg_bot[2]) / 2)
+                canvas = Image.new("RGB", (target_w, target_h), (r, g, b))
+            else:
+                # Varied/scenic image: blurred background
+                bg_card = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                bg_card = bg_card.filter(ImageFilter.GaussianBlur(radius=25))
+                bg_card = ImageEnhance.Brightness(bg_card).enhance(0.75)
+                canvas = bg_card
+
+            canvas.paste(img, (paste_x, paste_y))
+
+        else:
+            # Extreme portrait (ratio < 0.75): Pad horizontally to 4:5 ratio
+            target_h = h
+            target_w = int(h * 0.80)
+            paste_x = (target_w - w) // 2
+            paste_y = 0
+
+            sample_w = max(1, min(8, w // 4))
+            left_strip = img.crop((0, 0, sample_w, h))
+            right_strip = img.crop((max(0, w - sample_w), 0, w, h))
+
+            stat_left = ImageStat.Stat(left_strip)
+            stat_right = ImageStat.Stat(right_strip)
+
+            left_std = max(stat_left.stddev[:3]) if len(stat_left.stddev) >= 3 else 0
+            right_std = max(stat_right.stddev[:3]) if len(stat_right.stddev) >= 3 else 0
+
+            avg_left = stat_left.mean[:3]
+            avg_right = stat_right.mean[:3]
+            is_dark = max(avg_left) < 35 and max(avg_right) < 35
+            is_bright = min(avg_left) > 220 and min(avg_right) > 220
+
+            if is_dark:
+                canvas = Image.new("RGB", (target_w, target_h), (0, 0, 0))
+            elif is_bright:
+                canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+            elif left_std < 22 and right_std < 22:
+                r = int((avg_left[0] + avg_right[0]) / 2)
+                g = int((avg_left[1] + avg_right[1]) / 2)
+                b = int((avg_left[2] + avg_right[2]) / 2)
+                canvas = Image.new("RGB", (target_w, target_h), (r, g, b))
+            else:
+                bg_card = img.resize((target_w, target_h), Image.Resampling.LANCZOS)
+                bg_card = bg_card.filter(ImageFilter.GaussianBlur(radius=25))
+                bg_card = ImageEnhance.Brightness(bg_card).enhance(0.75)
+                canvas = bg_card
+
+            canvas.paste(img, (paste_x, paste_y))
+
+        # Save with high quality and subsampling=0 for sharp text and logos
+        canvas.save(image_path, "JPEG", quality=95, subsampling=0)
+        logger.info(
+            f"🖼️ [Image Adaptation] Successfully adapted image {image_path} from ({w}x{h}, ratio {ratio:.2f}) to ({target_w}x{target_h})."
+        )
+        return image_path
+    except Exception as e:
+        logger.error(f"Error adapting image {image_path} for WhatsApp: {e}")
+        return image_path
+
+
+# ---------- Entity & Caption Formatting (Fix 2.1 & 3.5 & Sanitization) ----------
 
 
 def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> str:
     """
     Translates Telegram MessageEntity offset formatting to WhatsApp markdown.
     - Preserves emoji and surrogate pair indexing via UTF-16 code units.
-    - Supports bold, italic, strikethrough, monospace, blockquotes, and text links.
+    - Merges overlapping or touching entities of the same type to prevent doubled delimiters (e.g. **).
+    - Excludes whitespace from inside delimiters so WhatsApp parses bold/italics reliably.
     - Places URL links OUTSIDE formatting delimiters to prevent underscore italic collisions (Fix 3.5).
     - Uses LIFO suffix insertion for symmetric nesting.
+    - Post-processes string to eliminate duplicate formatting characters.
     """
     if not caption or not entities:
         return caption or ""
@@ -2000,41 +2141,77 @@ def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> 
         str_idx += 1
     utf16_to_str_idx[utf16_idx] = str_idx
 
-    prefix_insertions: dict[int, list[str]] = {}
-    suffix_insertions: dict[int, list[str]] = {}
-    link_insertions: dict[int, list[str]] = {}
+    mergeable_types = {"bold", "italic", "strikethrough", "code", "spoiler"}
+    by_type: dict[str, list[list[int]]] = {}
+    other_entities: list[tuple[str, int, int, str | None]] = []
 
     for ent in entities:
         start = utf16_to_str_idx.get(ent.offset)
         end = utf16_to_str_idx.get(ent.offset + ent.length)
 
-        if start is None or end is None or start > end:
+        if start is None or end is None or start >= end:
             continue
 
+        if ent.type in mergeable_types:
+            # WhatsApp requires formatting characters to touch non-whitespace
+            while start < end and caption[start].isspace():
+                start += 1
+            while end > start and caption[end - 1].isspace():
+                end -= 1
+            if start < end:
+                by_type.setdefault(ent.type, []).append([start, end])
+        else:
+            other_entities.append((ent.type, start, end, getattr(ent, "url", None)))
+
+    # Merge overlapping or touching intervals of the same entity type
+    clean_entities: list[tuple[str, int, int, str | None]] = []
+    for ent_type, intervals in by_type.items():
+        intervals.sort(key=lambda x: (x[0], x[1]))
+        merged: list[list[int]] = []
+        for s, e in intervals:
+            if not merged:
+                merged.append([s, e])
+            else:
+                prev_s, prev_e = merged[-1]
+                if s <= prev_e:
+                    merged[-1][1] = max(prev_e, e)
+                else:
+                    merged.append([s, e])
+        for s, e in merged:
+            clean_entities.append((ent_type, s, e, None))
+
+    for item in other_entities:
+        clean_entities.append(item)
+
+    prefix_insertions: dict[int, list[str]] = {}
+    suffix_insertions: dict[int, list[str]] = {}
+    link_insertions: dict[int, list[str]] = {}
+
+    for ent_type, start, end, url in clean_entities:
         prefix = ""
         suffix = ""
 
-        if ent.type == "bold":
+        if ent_type == "bold":
             prefix, suffix = "*", "*"
-        elif ent.type == "italic":
+        elif ent_type == "italic":
             prefix, suffix = "_", "_"
-        elif ent.type == "strikethrough":
+        elif ent_type == "strikethrough":
             prefix, suffix = "~", "~"
-        elif ent.type == "code":
+        elif ent_type == "code":
             prefix, suffix = "`", "`"
-        elif ent.type == "pre":
+        elif ent_type == "pre":
             prefix, suffix = "```\n", "\n```"
-        elif ent.type == "spoiler":
+        elif ent_type == "spoiler":
             prefix, suffix = "||", "||"
-        elif ent.type in ("blockquote", "expandable_blockquote"):
+        elif ent_type in ("blockquote", "expandable_blockquote"):
             prefix = "> "
             # Multiline quotes: prefix each line
             for k in range(start, min(end, len(caption))):
                 if caption[k] == "\n" and k + 1 < end:
                     prefix_insertions.setdefault(k + 1, []).append("> ")
-        elif ent.type == "text_link" and getattr(ent, "url", None):
+        elif ent_type == "text_link" and url:
             # Place link URL outside of formatting delimiters (Fix 3.5)
-            link_insertions.setdefault(end, []).append(f" ({ent.url})")
+            link_insertions.setdefault(end, []).append(f" ({url})")
             continue
         else:
             continue
@@ -2055,7 +2232,13 @@ def format_caption_for_whatsapp(caption: str, entities: list[MessageEntity]) -> 
         if (i + 1) in link_insertions:
             result.extend(link_insertions[i + 1])
 
-    return "".join(result)
+    formatted = "".join(result)
+    # Post-processing sanitization: collapse duplicate formatting characters
+    formatted = re.sub(r"\*{2,}", "*", formatted)
+    formatted = re.sub(r"_{2,}", "_", formatted)
+    formatted = re.sub(r"~{2,}", "~", formatted)
+
+    return formatted
 
 
 # ---------- Message Delivery Engine (Fix 3.2) ----------
@@ -2540,6 +2723,9 @@ async def handle_channel_post(message: types.Message):
             try:
                 await photo.download(destination_file=photo_path)
                 if os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
+                    photo_path = await asyncio.to_thread(
+                        adapt_image_for_whatsapp_channel, photo_path
+                    )
                     downloaded_media = photo_path
                 else:
                     logger.error(f"Downloaded photo {photo_path} is missing or empty.")
