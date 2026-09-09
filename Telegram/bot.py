@@ -79,11 +79,13 @@ from analytics_card import (
     generate_analytics_text_report,
 )
 from auto_healer import AutoHealer
+from account_pool import AccountPool, CONFIGURED_ACCOUNTS, ID_TO_INDEX, ACCOUNT_INDICES
 
 bot = aiogram.Bot(config.bot_token)
 dp = aiogram.Dispatcher(bot)
 
 auto_healer = AutoHealer()
+account_pool = AccountPool()
 
 bot_client: TelegramClient | None = None
 http_session: aiohttp.ClientSession | None = None
@@ -316,8 +318,9 @@ async def help_command(message: Message):
         "🪄 /map [channel_id] - One-tap interactive WhatsApp group mapper wizard\n"
         "🛡️ /health_stats - WhatsApp deliverability rate & safety metrics\n"
         "🩺 /watchdog - WhatsApp socket health monitor & auto-reconnect status\n"
-        "🔑 /login - Generate WhatsApp login QR code\n"
-        "🚪 /logout - Disconnect and clean WhatsApp session\n"
+        "📱 /accounts - Multi-account pool dashboard & round-robin sender manager\n"
+        "🔑 /login [1-4] - Generate WhatsApp QR code for Account 1, 2, 3, or 4\n"
+        "🚪 /logout [1-4] - Disconnect and clean a specific WhatsApp session\n"
         "🔍 /get_chat_id &lt;group_name&gt; - Find WhatsApp group or newsletter JID\n"
         "➕ /add_group &lt;channel_id&gt; &lt;group_id&gt; - Map channel to WhatsApp group\n"
         "➖ /delete_group &lt;channel_id&gt; &lt;group_id&gt; - Remove group mapping\n"
@@ -471,11 +474,13 @@ async def status_command(message: Message):
     rate_stats = rate_controller.get_stats()
     dlq_count = await asyncio.to_thread(get_failed_messages_count)
     telemetry_card = get_server_telemetry(baileys_ram_mb=baileys_ram_mb)
+    pool_summary = account_pool.get_pool_summary()
 
     status_text = (
         "📊 <b>Forwarder System Status</b>\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"<b>WhatsApp Gateway</b>: {wa_status} ({latency_ms} ms)\n"
+        f"<b>WhatsApp Sender Pool</b>: <code>{pool_summary}</code>\n"
         f"<b>Account Health</b>: <code>{rate_stats['status']}</code>\n"
         f"<b>Hourly Volume</b>: <code>{rate_stats['hour_count']} / {rate_stats['max_per_hour']}</code> ({rate_stats['hour_percent']}%)\n"
         f"<b>Daily Volume</b>: <code>{rate_stats['day_count']} / {rate_stats['max_per_day']}</code> ({rate_stats['day_percent']}%)\n"
@@ -1126,9 +1131,10 @@ async def get_chat_id_command(message: Message):
         return
 
     clean_query = args.strip().strip("<>\"'`")
+    active_sender = account_pool.get_ready_accounts()[0]
     data = {
         "chatName": clean_query,
-        "clientId": "user",
+        "clientId": active_sender,
     }
 
     try:
@@ -1177,19 +1183,91 @@ async def get_chat_id_command(message: Message):
         await message.reply("Failed to connect to WhatsApp service.")
 
 
-@dp.message_handler(commands=["login"])
-async def login_whatsapp(message: Message):
-    if not message.chat.type == "private" or not is_admin(message.from_user.id):
-        return
+async def _sync_account_pool_now() -> None:
+    """Queries WhatsApp GET /sessions endpoint and updates live AccountPool metadata."""
+    try:
+        session = await get_http_session()
+        if session:
+            async with session.get(
+                f"{config.whatsapp_service}/sessions",
+                headers=get_http_headers(),
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    account_pool.sync_from_api_response(data)
+        else:
+            def _sync():
+                return requests.get(
+                    f"{config.whatsapp_service}/sessions",
+                    headers=get_http_headers(),
+                    timeout=5,
+                )
+            res_sync = await asyncio.to_thread(_sync)
+            if res_sync.status_code == 200:
+                data = res_sync.json()
+                account_pool.sync_from_api_response(data)
+    except Exception as e:
+        logger.debug(f"[AccountPool] _sync_account_pool_now exception: {e}")
 
-    data = {"clientId": "user"}
+
+def build_accounts_keyboard() -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    keyboard.row(
+        InlineKeyboardButton("🔄 Refresh Status", callback_data="cb:acc:refresh")
+    )
+    keyboard.row(
+        InlineKeyboardButton("🔑 Login Account...", callback_data="cb:acc:login_menu"),
+        InlineKeyboardButton("🚪 Logout Account...", callback_data="cb:acc:logout_menu"),
+    )
+    keyboard.row(
+        InlineKeyboardButton("📊 System Status", callback_data="cb:acc:status")
+    )
+    return keyboard
+
+
+def build_account_select_keyboard(action_prefix: str) -> InlineKeyboardMarkup:
+    keyboard = InlineKeyboardMarkup(row_width=2)
+    btns = []
+    for acc in account_pool.get_all_accounts():
+        idx = acc["index"]
+        status_icon = "🟢" if acc["is_ready"] else ("🟡" if acc["status"] == "waiting_qr_scan" else "⚪")
+        phone_hint = f" ({acc['phone'][-4:]})" if acc.get("phone") else ""
+        btns.append(
+            InlineKeyboardButton(
+                f"{status_icon} Account {idx}{phone_hint}",
+                callback_data=f"{action_prefix}:{idx}",
+            )
+        )
+    keyboard.add(*btns)
+    keyboard.row(InlineKeyboardButton("🔙 Back to Pool", callback_data="cb:acc:back"))
+    return keyboard
+
+
+async def _perform_login_for_account(message_or_call, account_index: int):
+    target_id = ACCOUNT_INDICES.get(account_index, "user")
+    data = {"clientId": target_id}
+
+    send_reply = (
+        message_or_call.reply
+        if isinstance(message_or_call, Message)
+        else message_or_call.message.reply
+    )
+    send_photo = (
+        message_or_call.reply_photo
+        if isinstance(message_or_call, Message)
+        else message_or_call.message.reply_photo
+    )
 
     try:
         status_code, res_data = await post_whatsapp_json("createsession", data, timeout_sec=30)
-
         if status_code == 200:
             if res_data.get("ready"):
-                await message.reply("✅ WhatsApp session is already authorized and ready.")
+                await send_reply(
+                    f"✅ <b>Account {account_index}</b> is already authorized and ready.",
+                    parse_mode=ParseMode.HTML,
+                )
+                await _sync_account_pool_now()
                 return
 
             qr_data = res_data.get("qrcode")
@@ -1197,25 +1275,184 @@ async def login_whatsapp(message: Message):
                 qr_path = generate_qr_code(qr_data)
                 try:
                     with open(qr_path, "rb") as qr_fp:
-                        await message.reply_photo(
-                            qr_fp, caption="Scan this QR code with WhatsApp."
+                        await send_photo(
+                            qr_fp,
+                            caption=(
+                                f"📱 <b>WhatsApp Login QR Code</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"Target Slot: <b>Account {account_index}</b>\n\n"
+                                f"Open WhatsApp on the device you want to link:\n"
+                                f"<b>Settings ➔ Linked Devices ➔ Link a Device</b>\n\n"
+                                f"Once scanned, Account {account_index} will automatically join the active round-robin pool."
+                            ),
+                            parse_mode=ParseMode.HTML,
                         )
                 finally:
                     if os.path.exists(qr_path):
                         os.remove(qr_path)
+                await _sync_account_pool_now()
             else:
-                await message.reply(f"ℹ️ {res_data.get('message')}")
+                await send_reply(f"ℹ️ Account {account_index}: {res_data.get('message')}")
         elif status_code == 202:
-            await message.reply(
-                "⏳ Session is initializing in the background. Please wait a few seconds and run /status or /login again."
+            await send_reply(
+                f"⏳ Account {account_index} session is initializing in the background. Please wait a few moments and run <code>/login {account_index}</code> or <code>/accounts</code>.",
+                parse_mode=ParseMode.HTML,
             )
         elif status_code == 400:
-            await message.reply(f"ℹ️ {res_data.get('message')}")
+            await send_reply(f"ℹ️ Account {account_index}: {res_data.get('message')}")
         else:
-            await message.reply("Failed to create session.")
+            await send_reply(f"❌ Failed to create session for Account {account_index}.")
     except Exception as e:
-        logger.error(f"Error in login_whatsapp: {e}")
-        await message.reply("Error contacting WhatsApp service.")
+        logger.error(f"Error in _perform_login_for_account({account_index}): {e}")
+        await send_reply(f"❌ Error contacting WhatsApp service for Account {account_index}: {e}")
+
+
+async def _perform_logout_for_account(message_or_call, account_index: int):
+    target_id = ACCOUNT_INDICES.get(account_index, "user")
+    data = {"clientId": target_id}
+    send_reply = (
+        message_or_call.reply
+        if isinstance(message_or_call, Message)
+        else message_or_call.message.reply
+    )
+
+    try:
+        status_code, res_data = await post_whatsapp_json("logout", data, timeout_sec=30)
+        if status_code == 200:
+            await send_reply(f"✅ Account {account_index} logged out and session cleared successfully.")
+            await _sync_account_pool_now()
+        elif status_code == 400:
+            await send_reply(f"ℹ️ Account {account_index}: {res_data.get('message')}")
+        else:
+            await send_reply(f"❌ Failed to log out Account {account_index}. Please try again later.")
+    except Exception as e:
+        logger.error(f"Error in _perform_logout_for_account({account_index}): {e}")
+        await send_reply(f"❌ Failed to connect to WhatsApp service: {e}")
+
+
+@dp.message_handler(commands=["accounts", "sessions", "pool"])
+async def accounts_command(message: Message):
+    if not message.chat.type == "private" or not is_admin(message.from_user.id):
+        return
+
+    await _sync_account_pool_now()
+    text = account_pool.format_dashboard_card()
+    kb = build_accounts_keyboard()
+    await message.reply(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cb:acc:"))
+async def account_pool_callback_handler(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized", show_alert=True)
+        return
+
+    action = call.data[len("cb:acc:"):]
+
+    if action == "refresh":
+        await call.answer("🔄 Refreshing pool...", show_alert=False)
+        await _sync_account_pool_now()
+        text = account_pool.format_dashboard_card()
+        kb = build_accounts_keyboard()
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        return
+
+    elif action == "login_menu":
+        await _sync_account_pool_now()
+        kb = build_account_select_keyboard("cb:acc:login")
+        try:
+            await call.message.edit_text(
+                "🔑 <b>Select WhatsApp Account to Log In:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Choose an account slot to generate a QR code:\n"
+                "• 🟢 = Already Active & Ready\n"
+                "• 🟡 = Waiting for Scan\n"
+                "• ⚪ = Not Logged In",
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+    elif action == "logout_menu":
+        await _sync_account_pool_now()
+        kb = build_account_select_keyboard("cb:acc:logout")
+        try:
+            await call.message.edit_text(
+                "🚪 <b>Select WhatsApp Account to Log Out:</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "Choose which account session to disconnect and wipe:",
+                reply_markup=kb,
+                parse_mode=ParseMode.HTML,
+            )
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+    elif action == "back":
+        await _sync_account_pool_now()
+        text = account_pool.format_dashboard_card()
+        kb = build_accounts_keyboard()
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+    elif action == "status":
+        await call.answer("Opening system status...", show_alert=False)
+        await status_command(call.message)
+        return
+
+    elif action.startswith("login:"):
+        idx_str = action.split(":", 1)[1]
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            idx = 1
+        await call.answer(f"Initiating login for Account {idx}...")
+        await _perform_login_for_account(call, idx)
+        return
+
+    elif action.startswith("logout:"):
+        idx_str = action.split(":", 1)[1]
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            idx = 1
+        await call.answer(f"Logging out Account {idx}...")
+        await _perform_logout_for_account(call, idx)
+        return
+
+
+@dp.message_handler(commands=["login"])
+async def login_whatsapp(message: Message):
+    if not message.chat.type == "private" or not is_admin(message.from_user.id):
+        return
+
+    args = message.get_args()
+    if args and args.strip():
+        account_id = account_pool.resolve_account_id(args.strip())
+        account_idx = account_pool.get_index_for_id(account_id)
+        await _perform_login_for_account(message, account_idx)
+    else:
+        await _sync_account_pool_now()
+        kb = build_account_select_keyboard("cb:acc:login")
+        await message.reply(
+            "🔑 <b>Select WhatsApp Account to Log In:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "You can run up to 4 parallel WhatsApp accounts simultaneously.\n"
+            "Choose an account slot below (or use <code>/login 1</code> to <code>/login 4</code>):",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
 
 
 @dp.message_handler(commands=["listen"])
@@ -1223,7 +1460,9 @@ async def listen_whatsapp(message: Message):
     if not message.chat.type == "private" or not is_admin(message.from_user.id):
         return
 
-    data = {"clientId": "user"}
+    args = message.get_args()
+    client_id = account_pool.resolve_account_id(args.strip()) if args and args.strip() else "user"
+    data = {"clientId": client_id}
 
     try:
         status_code, res_data = await post_whatsapp_json("startlistening", data, timeout_sec=30)
@@ -1241,19 +1480,22 @@ async def logout_whatsapp(message: Message):
     if not message.chat.type == "private" or not is_admin(message.from_user.id):
         return
 
-    data = {"clientId": "user"}
-
-    try:
-        status_code, res_data = await post_whatsapp_json("logout", data, timeout_sec=30)
-        if status_code == 200:
-            await message.reply("Logged out and session files removed successfully.")
-        elif status_code == 400:
-            await message.reply(f"ℹ️ {res_data.get('message')}")
-        else:
-            await message.reply("Failed to log out. Please try again later.")
-    except Exception as e:
-        logger.error(f"Error in logout_whatsapp: {e}")
-        await message.reply("Failed to connect to WhatsApp service.")
+    args = message.get_args()
+    if args and args.strip():
+        account_id = account_pool.resolve_account_id(args.strip())
+        account_idx = account_pool.get_index_for_id(account_id)
+        await _perform_logout_for_account(message, account_idx)
+    else:
+        await _sync_account_pool_now()
+        kb = build_account_select_keyboard("cb:acc:logout")
+        await message.reply(
+            "🚪 <b>Select WhatsApp Account to Log Out:</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Choose which account session to disconnect and clear:\n"
+            "(Or use <code>/logout 1</code> to <code>/logout 4</code>)",
+            reply_markup=kb,
+            parse_mode=ParseMode.HTML,
+        )
 
 
 
@@ -2463,6 +2705,7 @@ async def send_to_single_group(
 
             for attempt in range(max_retries + 1):
                 t_start = time.time()
+                sender_id = await account_pool.get_next_sender()
                 if downloaded_media:
                     if not os.path.exists(downloaded_media):
                         logger.error(
@@ -2497,7 +2740,7 @@ async def send_to_single_group(
                         if session:
                             with open(downloaded_media, "rb") as fp:
                                 data = aiohttp.FormData()
-                                data.add_field("clientId", "user")
+                                data.add_field("clientId", sender_id)
                                 data.add_field("groupId", group)
                                 data.add_field("caption", caption or "")
                                 data.add_field(
@@ -2522,7 +2765,7 @@ async def send_to_single_group(
                             def send_media_sync():
                                 with open(downloaded_media, "rb") as fp:
                                     files = {"media": (fname, fp)}
-                                    data = {"clientId": "user", "groupId": group, "caption": caption or ""}
+                                    data = {"clientId": sender_id, "groupId": group, "caption": caption or ""}
                                     return requests.post(
                                         f"{config.whatsapp_service}/sendMedia",
                                         data=data,
@@ -2543,6 +2786,7 @@ async def send_to_single_group(
 
                         if status_code == 200:
                             success = True
+                            account_pool.record_dispatched(sender_id)
                             record_delivery_metric(
                                 content_type=content_type,
                                 latency_ms=last_latency_ms,
@@ -2550,7 +2794,7 @@ async def send_to_single_group(
                                 failed=False,
                             )
                             logger.info(
-                                f"Media message sent to group {group} successfully."
+                                f"Media message sent to group {group} via {sender_id} successfully."
                             )
                             rate_controller.record_sent()
                             await check_and_alert_health()
@@ -2559,7 +2803,7 @@ async def send_to_single_group(
                             last_err_msg = msg
                             last_err_detail = err_detail
                             logger.warning(
-                                f"WhatsApp service returned {status_code} for {group}. Retrying in {(attempt+1)*2}s (attempt {attempt+1}/{max_retries})..."
+                                f"WhatsApp service returned {status_code} for {group} (sender: {sender_id}). Retrying in {(attempt+1)*2}s (attempt {attempt+1}/{max_retries})..."
                             )
                             await asyncio.sleep((attempt + 1) * 2)
                             continue
@@ -2567,9 +2811,10 @@ async def send_to_single_group(
                             last_err_msg = msg
                             last_err_detail = err_detail
                             logger.error(
-                                f"Failed to send media message to group {group}: {msg} ({err_detail})"
+                                f"Failed to send media message to group {group} via {sender_id}: {msg} ({err_detail})"
                             )
-                            if "Session is not authorized" in str(msg):
+                            if "Session is not authorized" in str(msg) or "session" in str(msg).lower():
+                                account_pool.mark_degraded(sender_id, cooldown_sec=120)
                                 await notify_admins_auth_required()
                             break
                     except Exception as e:
@@ -2577,7 +2822,7 @@ async def send_to_single_group(
                         last_latency_ms = (time.time() - t_start) * 1000.0
                         if attempt < max_retries:
                             logger.warning(
-                                f"Error connecting to WhatsApp service for group {group}: {e}. Retrying in {(attempt+1)*2}s..."
+                                f"Error connecting to WhatsApp service for group {group} (sender: {sender_id}): {e}. Retrying in {(attempt+1)*2}s..."
                             )
                             await asyncio.sleep((attempt + 1) * 2)
                             continue
@@ -2587,7 +2832,7 @@ async def send_to_single_group(
                         break
 
                 else:
-                    data = {"clientId": "user", "groupId": group, "text": caption}
+                    data = {"clientId": sender_id, "groupId": group, "text": caption}
                     status_code = 500
                     msg = ""
                     err_detail = ""
@@ -2626,6 +2871,7 @@ async def send_to_single_group(
 
                         if status_code == 200:
                             success = True
+                            account_pool.record_dispatched(sender_id)
                             record_delivery_metric(
                                 content_type=content_type,
                                 latency_ms=last_latency_ms,
@@ -2633,7 +2879,7 @@ async def send_to_single_group(
                                 failed=False,
                             )
                             logger.info(
-                                f"Text message sent to group {group} successfully."
+                                f"Text message sent to group {group} via {sender_id} successfully."
                             )
                             rate_controller.record_sent()
                             await check_and_alert_health()
@@ -2642,7 +2888,7 @@ async def send_to_single_group(
                             last_err_msg = msg
                             last_err_detail = err_detail
                             logger.warning(
-                                f"WhatsApp service returned {status_code} for {group}. Retrying in {(attempt+1)*2}s (attempt {attempt+1}/{max_retries})..."
+                                f"WhatsApp service returned {status_code} for {group} (sender: {sender_id}). Retrying in {(attempt+1)*2}s (attempt {attempt+1}/{max_retries})..."
                             )
                             await asyncio.sleep((attempt + 1) * 2)
                             continue
@@ -2650,9 +2896,10 @@ async def send_to_single_group(
                             last_err_msg = msg
                             last_err_detail = err_detail
                             logger.error(
-                                f"Failed to send text message to group {group}: {msg} ({err_detail})"
+                                f"Failed to send text message to group {group} via {sender_id}: {msg} ({err_detail})"
                             )
-                            if "Session is not authorized" in str(msg):
+                            if "Session is not authorized" in str(msg) or "session" in str(msg).lower():
+                                account_pool.mark_degraded(sender_id, cooldown_sec=120)
                                 await notify_admins_auth_required()
                             break
                     except Exception as e:
@@ -3517,6 +3764,24 @@ async def scheduled_auto_healer_loop():
             await asyncio.sleep(60)
 
 
+async def scheduled_account_pool_sync_loop():
+    """
+    Background loop that continuously syncs multi-account status from
+    WhatsApp microservice GET /sessions every 30 seconds.
+    """
+    await asyncio.sleep(5)
+    logger.info("[AccountPool] Background account pool sync loop started.")
+    while True:
+        try:
+            await _sync_account_pool_now()
+            await asyncio.sleep(30)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"[AccountPool] Sync loop error: {e}")
+            await asyncio.sleep(30)
+
+
 async def on_startup(_):
     logger.info("Bot starting up...")
     cleanup_stale_media()
@@ -3526,6 +3791,7 @@ async def on_startup(_):
     asyncio.create_task(scheduled_stale_channel_detector_loop())
     asyncio.create_task(scheduled_session_watchdog_loop())
     asyncio.create_task(scheduled_auto_healer_loop())
+    asyncio.create_task(scheduled_account_pool_sync_loop())
     asyncio.create_task(sync_database_newsletters_to_whatsapp())
     print("Bot is up and operational.")
 

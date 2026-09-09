@@ -48,14 +48,29 @@ interface SessionEntry {
     isRestarting: boolean;
     restartTimer?: NodeJS.Timeout;
     isListening: boolean;
+    phoneNumber?: string;
+    pushName?: string;
+    connectedAt?: string;
 }
 
 const sessions: Record<string, SessionEntry> = {};
 
-// ---------- Client ID Sanitization ----------
+// Configured multi-account slots (up to 4 concurrent accounts)
+const CONFIGURED_ACCOUNTS = [
+    { id: "user", index: 1, label: "Account 1" },
+    { id: "account2", index: 2, label: "Account 2" },
+    { id: "account3", index: 3, label: "Account 3" },
+    { id: "account4", index: 4, label: "Account 4" },
+];
+
+// ---------- Client ID Sanitization & Aliasing ----------
 function sanitizeClientId(rawId: any): string {
-    const id = String(rawId || clientId || "user").trim();
-    const clean = id.replace(/[^a-zA-Z0-9_-]/g, "");
+    const raw = String(rawId || clientId || "user").trim();
+    if (raw === "1" || raw.toLowerCase() === "account1") return "user";
+    if (raw === "2" || raw.toLowerCase() === "account2") return "account2";
+    if (raw === "3" || raw.toLowerCase() === "account3") return "account3";
+    if (raw === "4" || raw.toLowerCase() === "account4") return "account4";
+    const clean = raw.replace(/[^a-zA-Z0-9_-]/g, "");
     return clean || "user";
 }
 
@@ -314,6 +329,18 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
             entry.isReady = true;
             entry.currentQR = undefined;
             entry.isRestarting = false;
+            entry.connectedAt = new Date().toISOString();
+            try {
+                if (sock.user) {
+                    const rawJid = sock.user.id || "";
+                    const num = rawJid.split(":")[0] || rawJid.split("@")[0] || "";
+                    entry.phoneNumber = num ? `+${num}` : undefined;
+                    entry.pushName = sock.user.name || undefined;
+                    console.log(`[${safeId}] Phone: ${entry.phoneNumber || "Unknown"} (${entry.pushName || "No Name"})`);
+                }
+            } catch (err) {
+                console.warn(`[${safeId}] Error extracting user info:`, err);
+            }
             const listeners = [...entry.readyListeners];
             entry.readyListeners = [];
             listeners.forEach((fn) => fn());
@@ -396,6 +423,56 @@ app.get("/health", (req, res) => {
             heapUsedBytes: mem.heapUsed,
             heapUsedMb: Math.round(mem.heapUsed / (1024 * 1024)),
         },
+    });
+});
+
+app.get("/sessions", (req, res) => {
+    const accountsInfo = CONFIGURED_ACCOUNTS.map((acc) => {
+        const entry = sessions[acc.id];
+        const isReady = Boolean(entry && entry.isReady && entry.sock);
+        const hasAuthFolder = fs.existsSync(path.resolve(".baileys_auth", `session-${acc.id}`));
+
+        let phone = entry?.phoneNumber;
+        let name = entry?.pushName;
+        if (!phone && entry?.sock?.user) {
+            const rawJid = entry.sock.user.id || "";
+            const num = rawJid.split(":")[0] || rawJid.split("@")[0] || "";
+            if (num) phone = `+${num}`;
+            if (entry.sock.user.name) name = entry.sock.user.name;
+        }
+
+        let status = "not_logged_in";
+        if (isReady) {
+            status = "ready";
+        } else if (entry && entry.currentQR) {
+            status = "waiting_qr_scan";
+        } else if (entry && entry.isRestarting) {
+            status = "reconnecting";
+        } else if (hasAuthFolder) {
+            status = "disconnected";
+        }
+
+        return {
+            id: acc.id,
+            index: acc.index,
+            label: acc.label,
+            isReady,
+            status,
+            phone: phone || null,
+            name: name || null,
+            connectedAt: entry?.connectedAt || null,
+            hasAuthFolder,
+            hasPendingQR: Boolean(entry?.currentQR),
+        };
+    });
+
+    const readyCount = accountsInfo.filter((a) => a.isReady).length;
+
+    res.json({
+        accounts: accountsInfo,
+        readyCount,
+        totalConfigured: CONFIGURED_ACCOUNTS.length,
+        timestamp: new Date().toISOString(),
     });
 });
 
