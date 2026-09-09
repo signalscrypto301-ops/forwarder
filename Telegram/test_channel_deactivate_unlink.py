@@ -333,6 +333,60 @@ class TestChannelDeactivateAndUnlink(unittest.IsolatedAsyncioTestCase):
             await bot.handle_channel_post(msg)
             send_mock.assert_not_called()
 
+    async def test_help_command_contains_all_slash_commands_and_details(self):
+        """Verify that /help contains all slash commands, short details, and panel instructions."""
+        msg = MagicMock()
+        msg.chat.type = "private"
+        msg.from_user.id = 12345
+        msg.reply = AsyncMock()
+
+        with patch.object(bot, "is_admin", return_value=True):
+            await bot.help_command(msg)
+            msg.reply.assert_called_once()
+            help_text = msg.reply.call_args[0][0]
+
+            # Verify length is safely within Telegram's 4096 limit
+            self.assertLess(len(help_text), 4000)
+
+            # Verify core slash commands are included
+            self.assertIn("/status", help_text)
+            self.assertIn("/healer", help_text)
+            self.assertIn("/telemetry", help_text)
+            self.assertIn("/analytics", help_text)
+            self.assertIn("/report", help_text)
+            self.assertIn("/failed", help_text)
+            self.assertIn("/stale", help_text)
+            self.assertIn("/channels", help_text)
+            self.assertIn("/deactivate", help_text)
+            self.assertIn("/activate", help_text)
+            self.assertIn("/unlink", help_text)
+            self.assertIn("/pause_all", help_text)
+            self.assertIn("/resume_all", help_text)
+            self.assertIn("/map", help_text)
+            self.assertIn("/accounts", help_text)
+            self.assertIn("/login", help_text)
+            self.assertIn("/logout", help_text)
+            self.assertIn("/add_channel", help_text)
+            self.assertIn("/delete_channel", help_text)
+            self.assertIn("/add_group", help_text)
+            self.assertIn("/delete_group", help_text)
+            self.assertIn("/view_groups", help_text)
+            self.assertIn("/get_chat_id", help_text)
+            self.assertIn("/watchdog", help_text)
+            self.assertIn("/health_stats", help_text)
+            self.assertIn("/listen", help_text)
+
+            # Verify details about deactivation and unlinking
+            self.assertIn("Pause forwarding for a channel", help_text)
+            self.assertIn("Resume forwarding for a paused channel", help_text)
+            self.assertIn("Unlink ALL destinations", help_text)
+
+            # Verify interactive panel features
+            self.assertIn("INTERACTIVE PANEL FEATURES (/channels)", help_text)
+            self.assertIn("ACTIVE", help_text)
+            self.assertIn("PAUSED", help_text)
+            self.assertIn("DEACTIVATED", help_text)
+
 
 if __name__ == "__main__":
     unittest.main()
