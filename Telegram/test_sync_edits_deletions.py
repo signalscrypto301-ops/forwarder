@@ -312,6 +312,46 @@ class TestSyncEditsDeletions(unittest.IsolatedAsyncioTestCase):
             await bot.handle_channel_post(msg)
             self.assertEqual(adapt_mock_std.call_count, 0)
 
+    async def test_handle_channel_post_adapts_image_document_for_newsletter(self):
+        """Image documents (e.g. uncompressed chart PNG/JPG) forwarded to @newsletter should be adapted."""
+        msg = MagicMock()
+        msg.chat.id = self.test_cid
+        msg.message_id = 901
+        msg.content_type = "document"
+        msg.text = None
+        msg.caption = "Chart Document"
+        msg.caption_entities = []
+        msg.media_group_id = None
+        msg.video = None
+        msg.video_note = None
+        msg.animation = None
+
+        doc_mock = MagicMock()
+        doc_mock.file_unique_id = "doc_img_901"
+        doc_mock.file_name = "chart.jpg"
+        doc_mock.mime_type = "image/jpeg"
+        doc_mock.file_size = 500000
+
+        async def fake_doc_download(destination_file):
+            with open(destination_file, "wb") as f:
+                f.write(b"fake_jpeg_data")
+
+        doc_mock.download = AsyncMock(side_effect=fake_doc_download)
+        msg.document = doc_mock
+
+        cid = clean_id(self.test_cid)
+        database.add_channel(cid)
+        database.add_group_for_channel(cid, "120363@newsletter")
+
+        adapt_mock = MagicMock(side_effect=lambda p: p)
+        send_mock = AsyncMock()
+
+        with patch.object(bot, "adapt_image_for_whatsapp_channel", adapt_mock), \
+             patch.object(bot, "send_to_single_group", send_mock):
+
+            await bot.handle_channel_post(msg)
+            self.assertEqual(adapt_mock.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

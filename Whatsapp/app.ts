@@ -162,13 +162,13 @@ let saveNewslettersTimer: NodeJS.Timeout | null = null;
 
 function saveKnownNewsletters() {
     if (saveNewslettersTimer) return;
-    saveNewslettersTimer = setTimeout(() => {
+    saveNewslettersTimer = setTimeout(async () => {
         saveNewslettersTimer = null;
         try {
             const dir = path.dirname(KNOWN_NEWSLETTERS_FILE);
             if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
             const list = Array.from(knownNewslettersMap.values());
-            fs.writeFileSync(KNOWN_NEWSLETTERS_FILE, JSON.stringify(list, null, 2), "utf-8");
+            await fs.promises.writeFile(KNOWN_NEWSLETTERS_FILE, JSON.stringify(list, null, 2), "utf-8");
         } catch (e) {
             console.warn("Error writing known_newsletters.json:", e);
         }
@@ -1111,7 +1111,7 @@ app.post("/getGroups", async (req, res) => {
 
 // Helper function to build Baileys media payload with width/height/thumbnail
 async function buildMediaPayload(filePath: string, originalName: string | undefined, caption?: string): Promise<AnyMessageContent> {
-    const buffer = fs.readFileSync(filePath);
+    const buffer = await fs.promises.readFile(filePath);
     const mimeType = (mime.lookup(originalName || filePath) || "application/octet-stream") as string;
 
     if (mimeType.startsWith("image/")) {

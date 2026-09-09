@@ -945,11 +945,22 @@ async def handle_channel_post(message: types.Message):
 
             try:
                 await photo.download(destination_file=photo_path)
+                if not (os.path.exists(photo_path) and os.path.getsize(photo_path) > 0) and b_client:
+                    try:
+                        photo_msg = await b_client.get_messages(message.chat.id, ids=message.message_id)
+                        await photo_msg.download_media(file=photo_path)
+                    except Exception as te:
+                        logger.warning(f"Telethon fallback download for photo failed: {te}")
+
                 if os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
                     # Adapt image if forwarding to any WhatsApp channels/newsletters
                     has_newsletter = any("@newsletter" in g for g in groups)
                     if has_newsletter:
-                        adapt_fn = getattr(bot_mod, "adapt_image_for_whatsapp_channel", adapt_image_for_whatsapp_channel) if bot_mod else adapt_image_for_whatsapp_channel
+                        adapt_fn = (
+                            getattr(bot_mod, "adapt_image_for_whatsapp_channel", adapt_image_for_whatsapp_channel)
+                            if bot_mod
+                            else adapt_image_for_whatsapp_channel
+                        )
                         photo_path = await asyncio.to_thread(adapt_fn, photo_path)
                     downloaded_media = photo_path
                 else:
@@ -1120,6 +1131,16 @@ async def handle_channel_post(message: types.Message):
                     return
 
                 if os.path.exists(doc_file_path) and os.path.getsize(doc_file_path) > 0:
+                    has_newsletter = any("@newsletter" in g for g in groups)
+                    mime = (getattr(doc, "mime_type", "") or "").lower()
+                    ext = os.path.splitext(doc_file_path)[1].lower()
+                    if has_newsletter and (mime.startswith("image/") or ext in (".jpg", ".jpeg", ".png", ".webp")):
+                        adapt_fn = (
+                            getattr(bot_mod, "adapt_image_for_whatsapp_channel", adapt_image_for_whatsapp_channel)
+                            if bot_mod
+                            else adapt_image_for_whatsapp_channel
+                        )
+                        doc_file_path = await asyncio.to_thread(adapt_fn, doc_file_path)
                     downloaded_media = doc_file_path
                 else:
                     logger.error(f"Downloaded document {doc_file_path} is missing or empty.")
