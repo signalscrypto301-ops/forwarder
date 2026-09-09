@@ -466,11 +466,12 @@ async def status_command(message: Message):
     except Exception as e:
         wa_status = f"🔴 Unreachable: {e}"
 
-    channels = await asyncio.to_thread(get_all_channels)
-    total_channels = len(channels)
-    total_mappings = sum(
-        len(await asyncio.to_thread(get_groups_for_channel, ch)) for ch in channels
-    )
+    def _count_channels_and_mappings():
+        chs = get_all_channels()
+        mappings_cnt = sum(len(get_groups_for_channel(ch)) for ch in chs)
+        return len(chs), mappings_cnt
+
+    total_channels, total_mappings = await asyncio.to_thread(_count_channels_and_mappings)
     rate_stats = rate_controller.get_stats()
     dlq_count = await asyncio.to_thread(get_failed_messages_count)
     telemetry_card = get_server_telemetry(baileys_ram_mb=baileys_ram_mb)
