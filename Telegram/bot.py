@@ -124,10 +124,14 @@ from services.forwarder import (
 
 from tasks.watchdog import (
     _get_whatsapp_health,
+    _get_all_sessions_status,
     _watchdog_attempt_reconnect,
     scheduled_session_watchdog_loop,
     cmd_watchdog,
     register_watchdog_handlers,
+    _watchdog_account_failures,
+    _watchdog_account_outage_start,
+    _watchdog_account_reconnect_at,
 )
 
 from tasks.healer import (
