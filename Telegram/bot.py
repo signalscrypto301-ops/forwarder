@@ -70,15 +70,20 @@ from database import (
     get_top_active_channels,
     get_hourly_traffic_distribution,
     get_channel_volume_summary,
+    get_recent_auto_heals,
+    get_auto_heal_stats,
 )
 from rate_limiter import DeliveryRateController
 from analytics_card import (
     generate_analytics_infographic,
     generate_analytics_text_report,
 )
+from auto_healer import AutoHealer
 
 bot = aiogram.Bot(config.bot_token)
 dp = aiogram.Dispatcher(bot)
+
+auto_healer = AutoHealer()
 
 bot_client: TelegramClient | None = None
 http_session: aiohttp.ClientSession | None = None
@@ -299,6 +304,7 @@ async def help_command(message: Message):
     help_text = (
         "🤖 <b>Forwarder Admin Commands</b>:\n\n"
         "📊 /status - Live health dashboard & channel statistics\n"
+        "🩺 /healer - Automated System Health & RAM Auto-Healer dashboard\n"
         "📈 /analytics - Visual audience intelligence, top channels & traffic heatmap\n"
         "🖥️ /telemetry - Real-time server and container resource metrics\n"
         "📈 /report [YYYY-MM-DD] - Daily delivery report & performance summary\n"
@@ -485,31 +491,37 @@ async def status_command(message: Message):
     await message.reply(status_text, parse_mode=ParseMode.HTML)
 
 
+async def _fetch_baileys_ram_mb() -> int | None:
+    """Queries the WhatsApp service /health endpoint to retrieve current RSS memory in MB."""
+    try:
+        session = await get_http_session()
+        if session:
+            async with session.get(f"{config.whatsapp_service}/health", timeout=aiohttp.ClientTimeout(total=3)) as res:
+                if res.status == 200:
+                    data = await res.json()
+                    return data.get("memory", {}).get("rssMb")
+        else:
+            def _sync_get():
+                return requests.get(
+                    url=f"{config.whatsapp_service}/health",
+                    headers=get_http_headers(),
+                    timeout=3,
+                )
+            res_sync = await asyncio.to_thread(_sync_get)
+            if res_sync.status_code == 200:
+                data = res_sync.json()
+                return data.get("memory", {}).get("rssMb")
+    except Exception:
+        pass
+    return None
+
+
 @dp.message_handler(commands=["telemetry", "server_health", "resources"])
 async def telemetry_command(message: Message):
     if not message.chat.type == "private" or not is_admin(message.from_user.id):
         return
 
-    baileys_ram_mb = None
-    try:
-        session = await get_http_session()
-        if session:
-            async with session.get(f"{config.whatsapp_service}/health", timeout=3) as res:
-                if res.status == 200:
-                    data = await res.json()
-                    baileys_ram_mb = data.get("memory", {}).get("rssMb")
-        else:
-            res_sync = await asyncio.to_thread(
-                requests.get,
-                url=f"{config.whatsapp_service}/health",
-                headers=get_http_headers(),
-                timeout=3,
-            )
-            if res_sync.status_code == 200:
-                data = res_sync.json()
-                baileys_ram_mb = data.get("memory", {}).get("rssMb")
-    except Exception:
-        pass
+    baileys_ram_mb = await _fetch_baileys_ram_mb()
 
     text = (
         f"{get_server_telemetry(baileys_ram_mb)}\n"
@@ -517,6 +529,141 @@ async def telemetry_command(message: Message):
         "<i>Telemetry refreshed live.</i>"
     )
     await message.reply(text, parse_mode=ParseMode.HTML)
+
+
+def build_healer_keyboard() -> InlineKeyboardMarkup:
+    """Builds interactive management keyboard for the Auto-Healer dashboard."""
+    kb = InlineKeyboardMarkup(row_width=2)
+    kb.row(
+        InlineKeyboardButton("🧹 Clean Caches Now", callback_data="cb:hlr:clean_now"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔁 Soft-Restart WhatsApp", callback_data="cb:hlr:refresh_wa"),
+        InlineKeyboardButton("📋 Heal History", callback_data="cb:hlr:history"),
+    )
+    kb.row(
+        InlineKeyboardButton("🔄 Refresh Dashboard", callback_data="cb:hlr:refresh"),
+    )
+    return kb
+
+
+@dp.message_handler(commands=["healer", "autoheal", "ram"])
+async def healer_command(message: Message):
+    """
+    /healer - Automated System Health & RAM Auto-Healer interactive dashboard.
+    Displays live host RAM, CPU, disk, process RSS, temp media files, lifetime stats,
+    and provides one-click action buttons to clean caches, view history, or soft-restart.
+    """
+    if not message.chat.type == "private" or not is_admin(message.from_user.id):
+        return
+
+    baileys_ram_mb = await _fetch_baileys_ram_mb()
+    dashboard_text = auto_healer.format_dashboard_card(wa_memory_mb=baileys_ram_mb)
+    kb = build_healer_keyboard()
+    await message.reply(dashboard_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+
+
+@dp.callback_query_handler(lambda c: c.data and c.data.startswith("cb:hlr:"))
+async def handle_healer_callbacks(call: CallbackQuery):
+    """Handles inline button interactions for the /healer dashboard."""
+    if not is_admin(call.from_user.id):
+        await call.answer("Unauthorized.", show_alert=True)
+        return
+
+    action = call.data[7:]  # Strip 'cb:hlr:'
+
+    if action == "clean_now":
+        await call.answer("🧹 Purging temporary caches & reclaiming memory...", show_alert=False)
+        wa_res = {}
+        try:
+            status, wa_data = await post_whatsapp_json("cleanup", {}, timeout_sec=10)
+            if status == 200:
+                wa_res = wa_data
+        except Exception as e:
+            logger.debug(f"[Healer] WhatsApp cleanup notice: {e}")
+
+        result = auto_healer.perform_heal(
+            reason="Manual Admin Trigger", force=True, wa_cleanup_result=wa_res
+        )
+        reclaimed_mb = result.get("mb_reclaimed", 0.0)
+        files_purged = result.get("files_purged", 0)
+
+        baileys_ram_mb = await _fetch_baileys_ram_mb()
+        dashboard_text = auto_healer.format_dashboard_card(wa_memory_mb=baileys_ram_mb)
+        kb = build_healer_keyboard()
+        try:
+            await call.message.edit_text(dashboard_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await call.answer(f"✅ Cleaned {files_purged} files! Freed {reclaimed_mb} MB.", show_alert=True)
+        return
+
+    elif action == "refresh_wa":
+        await call.answer("🔁 Triggering WhatsApp soft-reconnect...", show_alert=False)
+        try:
+            status, data = await post_whatsapp_json("createsession", {"clientId": "user"}, timeout_sec=30)
+            if status == 200 and data.get("ready"):
+                msg = "✅ WhatsApp session is already ready and active."
+            elif data.get("qrcode"):
+                msg = "⚠️ WhatsApp returned a QR code — check /login."
+            else:
+                msg = "🔁 WhatsApp socket reconnect initiated successfully."
+        except Exception as e:
+            msg = f"❌ WhatsApp reconnect failed: {e}"
+
+        baileys_ram_mb = await _fetch_baileys_ram_mb()
+        dashboard_text = auto_healer.format_dashboard_card(wa_memory_mb=baileys_ram_mb)
+        kb = build_healer_keyboard()
+        try:
+            await call.message.edit_text(dashboard_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await call.answer(msg, show_alert=True)
+        return
+
+    elif action == "history":
+        recent = get_recent_auto_heals(limit=8)
+        if not recent:
+            history_text = (
+                "📋 <b>Auto-Healer Event History</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━━━\n"
+                "<i>No auto-heal events recorded yet. System has operated within healthy bounds.</i>"
+            )
+        else:
+            lines = [
+                "📋 <b>Auto-Healer Event History (Recent Events)</b>",
+                "━━━━━━━━━━━━━━━━━━━━━━",
+            ]
+            for r in recent:
+                reclaimed_str = f"{round(r['bytes_reclaimed'] / (1024*1024), 1)} MB" if r['bytes_reclaimed'] else "0 MB"
+                lines.append(
+                    f"• <b>{r['timestamp']}</b>\n"
+                    f"  Trigger: <code>{r['trigger_reason']}</code>\n"
+                    f"  Metrics: RAM {r['ram_percent']}%, Disk {r['disk_percent']}%\n"
+                    f"  Reclaimed: {reclaimed_str} ({r['files_purged']} files)\n"
+                    f"  Action: <i>{r['action_taken']}</i>\n"
+                )
+            history_text = "\n".join(lines)
+
+        kb = InlineKeyboardMarkup()
+        kb.add(InlineKeyboardButton("🔙 Back to Dashboard", callback_data="cb:hlr:refresh"))
+        try:
+            await call.message.edit_text(history_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await call.answer()
+        return
+
+    elif action == "refresh":
+        baileys_ram_mb = await _fetch_baileys_ram_mb()
+        dashboard_text = auto_healer.format_dashboard_card(wa_memory_mb=baileys_ram_mb)
+        kb = build_healer_keyboard()
+        try:
+            await call.message.edit_text(dashboard_text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await call.answer("Dashboard refreshed.")
+        return
 
 
 @dp.message_handler(commands=["health_stats", "rate_status"])
@@ -3322,6 +3469,54 @@ async def sync_database_newsletters_to_whatsapp():
         logger.debug(f"sync_database_newsletters_to_whatsapp notice: {e}")
 
 
+async def scheduled_auto_healer_loop():
+    """
+    Monitors VPS RAM, disk space, and temporary file accumulation every 60 seconds.
+    If critical thresholds are crossed (RAM >= 90%, disk >= 90%, or >= 20 temp files),
+    automatically executes cache purging, log trimming, and memory reclamation.
+    Dispatches an alert card to all configured administrators whenever a heal occurs.
+    """
+    await asyncio.sleep(30)  # Initial warm-up delay
+    logger.info("[AutoHealer] Automated System Health & RAM monitoring active (interval: 60s).")
+    while True:
+        try:
+            heal_res = await asyncio.to_thread(auto_healer.check_and_heal_if_needed)
+            if heal_res and heal_res.get("status") == "success":
+                # Purge WhatsApp uploads as well
+                wa_res = {}
+                try:
+                    status, wa_data = await post_whatsapp_json("cleanup", {}, timeout_sec=10)
+                    if status == 200:
+                        wa_res = wa_data
+                except Exception as wa_err:
+                    logger.debug(f"[AutoHealer] WhatsApp cleanup notice: {wa_err}")
+
+                alert_text = (
+                    "🩺 <b>Automated System Health & RAM Auto-Healer Triggered</b>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"<b>Trigger Reason:</b> <code>{heal_res['reason']}</code>\n"
+                    f"<b>Temporary Files Purged:</b> <code>{heal_res['files_purged']} files</code>\n"
+                    f"<b>Disk Space Reclaimed:</b> <code>{heal_res['mb_reclaimed']} MB</code>\n"
+                    f"<b>Memory Reclaimed:</b> <code>{heal_res['gc_mb_freed']} MB</code>\n"
+                    f"<b>Host RAM:</b> <code>{heal_res['ram_before']}% ➔ {heal_res['ram_after']}%</code>\n"
+                    "━━━━━━━━━━━━━━━━━━━━━━\n"
+                    "<i>Caches purged and resources stabilized before any lag or crash could occur.</i>"
+                )
+                for admin_id in config.admin_ids:
+                    try:
+                        await bot.send_message(admin_id, alert_text, parse_mode=ParseMode.HTML)
+                    except Exception as alert_err:
+                        logger.error(
+                            f"[AutoHealer] Failed to dispatch heal alert to admin {admin_id}: {alert_err}"
+                        )
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.error(f"[AutoHealer] Error in scheduled_auto_healer_loop: {e}")
+            await asyncio.sleep(60)
+
+
 async def on_startup(_):
     logger.info("Bot starting up...")
     cleanup_stale_media()
@@ -3330,6 +3525,7 @@ async def on_startup(_):
     asyncio.create_task(scheduled_daily_report_loop())
     asyncio.create_task(scheduled_stale_channel_detector_loop())
     asyncio.create_task(scheduled_session_watchdog_loop())
+    asyncio.create_task(scheduled_auto_healer_loop())
     asyncio.create_task(sync_database_newsletters_to_whatsapp())
     print("Bot is up and operational.")
 

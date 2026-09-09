@@ -399,6 +399,45 @@ app.get("/health", (req, res) => {
     });
 });
 
+app.post("/cleanup", async (req, res) => {
+    const uploadDir = path.resolve("uploads");
+    let filesPurged = 0;
+    let bytesReclaimed = 0;
+    if (fs.existsSync(uploadDir)) {
+        try {
+            const files = fs.readdirSync(uploadDir);
+            for (const f of files) {
+                const fp = path.join(uploadDir, f);
+                try {
+                    const stat = fs.statSync(fp);
+                    if (stat.isFile()) {
+                        bytesReclaimed += stat.size;
+                        fs.unlinkSync(fp);
+                        filesPurged++;
+                    }
+                } catch (_) {}
+            }
+        } catch (err) {
+            console.error("[AutoHealer] WhatsApp /cleanup error:", err);
+        }
+    }
+    if ((global as any).gc) {
+        try {
+            (global as any).gc();
+        } catch (_) {}
+    }
+    const mem = process.memoryUsage();
+    return res.json({
+        success: true,
+        filesPurged,
+        bytesReclaimed,
+        memory: {
+            rssMb: Math.round(mem.rss / (1024 * 1024)),
+            heapUsedMb: Math.round(mem.heapUsed / (1024 * 1024)),
+        },
+    });
+});
+
 app.post("/createsession", async (req, res) => {
     const targetId = sanitizeClientId(req.body.clientId || clientId);
     console.log("Creating session for clientId:", targetId);

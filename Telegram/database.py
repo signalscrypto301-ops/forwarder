@@ -149,6 +149,28 @@ def create_table():
         """
     )
 
+    # Table for Auto-Healer audit logs
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auto_heal_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            trigger_reason TEXT NOT NULL,
+            ram_percent REAL,
+            disk_percent REAL,
+            files_purged INTEGER DEFAULT 0,
+            bytes_reclaimed INTEGER DEFAULT 0,
+            action_taken TEXT
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_auto_heal_logs_timestamp
+        ON auto_heal_logs(timestamp)
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -803,6 +825,102 @@ def get_channel_volume_summary(date_key: str | None = None) -> dict:
         "peak_hour": peak_hour,
         "peak_hour_label": f"{peak_hour:02d}:00" if peak_hour is not None else "N/A",
         "peak_hour_volume": peak_count,
+    }
+
+
+def record_auto_heal_event(
+    trigger_reason: str,
+    ram_percent: float,
+    disk_percent: float,
+    files_purged: int = 0,
+    bytes_reclaimed: int = 0,
+    action_taken: str = "",
+) -> int:
+    """Records an automated or manual heal/purge event to SQLite."""
+    import datetime
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO auto_heal_logs (
+            timestamp, trigger_reason, ram_percent, disk_percent,
+            files_purged, bytes_reclaimed, action_taken
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            now_str,
+            str(trigger_reason),
+            float(ram_percent),
+            float(disk_percent),
+            int(files_purged),
+            int(bytes_reclaimed),
+            str(action_taken),
+        ),
+    )
+    new_id = cursor.lastrowid
+    connection.commit()
+    connection.close()
+    return new_id
+
+
+def get_recent_auto_heals(limit: int = 10) -> list:
+    """Returns the most recent auto-heal audit records."""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT id, timestamp, trigger_reason, ram_percent, disk_percent,
+               files_purged, bytes_reclaimed, action_taken
+        FROM auto_heal_logs
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    )
+    rows = cursor.fetchall()
+    connection.close()
+    results = []
+    for r in rows:
+        results.append({
+            "id": r[0],
+            "timestamp": r[1],
+            "trigger_reason": r[2],
+            "ram_percent": r[3],
+            "disk_percent": r[4],
+            "files_purged": r[5],
+            "bytes_reclaimed": r[6],
+            "action_taken": r[7],
+        })
+    return results
+
+
+def get_auto_heal_stats() -> dict:
+    """Computes lifetime auto-heal summary statistics."""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT 
+            COUNT(*),
+            COALESCE(SUM(files_purged), 0),
+            COALESCE(SUM(bytes_reclaimed), 0),
+            MAX(timestamp)
+        FROM auto_heal_logs
+        """
+    )
+    row = cursor.fetchone()
+    connection.close()
+    total_events = row[0] if row else 0
+    total_files = row[1] if row else 0
+    total_bytes = row[2] if row else 0
+    last_heal_time = row[3] if row and row[3] else None
+    return {
+        "total_events": total_events,
+        "total_files_purged": total_files,
+        "total_bytes_reclaimed": total_bytes,
+        "total_mb_reclaimed": round(total_bytes / (1024 * 1024), 1),
+        "last_heal_time": last_heal_time,
     }
 
 

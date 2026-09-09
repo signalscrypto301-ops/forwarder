@@ -1,4 +1,4 @@
-﻿import os
+import os
 import sys
 import unittest
 import tempfile
@@ -53,6 +53,9 @@ if aiogram_types_mod:
 
 import database
 import bot
+
+bot.InlineKeyboardMarkup = MockInlineKeyboardMarkup
+bot.InlineKeyboardButton = MockInlineKeyboardButton
 
 
 class TestDeadLetterQueue(unittest.TestCase):
