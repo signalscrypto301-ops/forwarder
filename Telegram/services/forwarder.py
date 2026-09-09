@@ -643,7 +643,15 @@ async def send_to_single_group(
                             logger.error(
                                 f"Failed to send media message to group {group} via {sender_id}: {msg} ({err_detail})"
                             )
-                            if "Session is not authorized" in str(msg) or "session" in str(msg).lower() or status_code in (401, 503):
+                            if "Session is not authorized" in str(msg) or status_code in (401, 403):
+                                logout_alert_fn = getattr(bot_mod, "send_instant_logout_alert", None)
+                                if logout_alert_fn:
+                                    await logout_alert_fn(sender_id, reason=f"Send error ({msg})")
+                                else:
+                                    if pool:
+                                        pool.mark_degraded(sender_id, cooldown_sec=120)
+                                    await notify_auth_fn()
+                            elif "session" in str(msg).lower() or status_code == 503:
                                 if pool:
                                     pool.mark_degraded(sender_id, cooldown_sec=120)
                                 await notify_auth_fn()
@@ -755,7 +763,15 @@ async def send_to_single_group(
                             logger.error(
                                 f"Failed to send text message to group {group} via {sender_id}: {msg} ({err_detail})"
                             )
-                            if "Session is not authorized" in str(msg) or "session" in str(msg).lower() or status_code in (401, 503):
+                            if "Session is not authorized" in str(msg) or status_code in (401, 403):
+                                logout_alert_fn = getattr(bot_mod, "send_instant_logout_alert", None)
+                                if logout_alert_fn:
+                                    await logout_alert_fn(sender_id, reason=f"Send error ({msg})")
+                                else:
+                                    if pool:
+                                        pool.mark_degraded(sender_id, cooldown_sec=120)
+                                    await notify_auth_fn()
+                            elif "session" in str(msg).lower() or status_code == 503:
                                 if pool:
                                     pool.mark_degraded(sender_id, cooldown_sec=120)
                                 await notify_auth_fn()

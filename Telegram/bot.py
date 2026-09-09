@@ -129,6 +129,8 @@ from tasks.watchdog import (
     _get_all_sessions_status,
     _watchdog_attempt_reconnect,
     scheduled_session_watchdog_loop,
+    send_instant_logout_alert,
+    scheduled_instant_disconnect_watchdog_loop,
     cmd_watchdog,
     register_watchdog_handlers,
     _watchdog_account_failures,
@@ -258,6 +260,7 @@ async def on_startup(_):
     asyncio.create_task(scheduled_daily_report_loop())
     asyncio.create_task(scheduled_stale_channel_detector_loop())
     asyncio.create_task(scheduled_session_watchdog_loop())
+    asyncio.create_task(scheduled_instant_disconnect_watchdog_loop())
     asyncio.create_task(scheduled_auto_healer_loop())
     asyncio.create_task(scheduled_account_pool_sync_loop())
     asyncio.create_task(sync_database_newsletters_to_whatsapp())

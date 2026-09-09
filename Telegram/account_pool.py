@@ -108,6 +108,46 @@ class AccountPool:
             ready = ["user"]
         return ready
 
+    def get_strictly_ready_accounts(self) -> list[str]:
+        """Returns accounts that are strictly ready and not degraded, without fallback."""
+        now = time.time()
+        return [
+            acc_id
+            for acc_id in CONFIGURED_ACCOUNTS
+            if self._accounts[acc_id]["is_ready"] and now >= self._accounts[acc_id]["degraded_until"]
+        ]
+
+    def format_active_siblings_string(self, exclude_account_id: str) -> str:
+        """
+        Returns human-readable text for remaining active siblings,
+        e.g. 'Account 1 & 3' or 'Account 1, 3 & 4' or 'Account 1'.
+        If no siblings are ready, returns an alert string.
+        """
+        canon_id = self.resolve_account_id(exclude_account_id)
+        short_labels = {
+            "user": "Account 1",
+            "account2": "Account 2",
+            "account3": "Account 3",
+            "account4": "Account 4",
+        }
+        active_siblings = [
+            acc_id for acc_id in self.get_strictly_ready_accounts()
+            if acc_id != canon_id
+        ]
+        if not active_siblings:
+            return "None (Pool Exhausted - Immediate Re-login Required)"
+
+        indices = [ID_TO_INDEX.get(acc_id, 1) for acc_id in active_siblings]
+        if not indices:
+            return "None (Pool Exhausted - Immediate Re-login Required)"
+        if len(indices) == 1:
+            return f"Account {indices[0]}"
+        elif len(indices) == 2:
+            return f"Account {indices[0]} & {indices[1]}"
+        else:
+            nums_str = ", ".join(str(x) for x in indices[:-1]) + f" & {indices[-1]}"
+            return f"Account {nums_str}"
+
     async def get_next_sender(self) -> str:
         """
         Thread-safe Round-Robin sender selection.

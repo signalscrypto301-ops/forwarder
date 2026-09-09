@@ -74,6 +74,52 @@ const CONFIGURED_ACCOUNTS = [
     { id: "account4", index: 4, label: "Account 4" },
 ];
 
+// ---------- Real-Time Disconnect & Auth Failure Events Queue ----------
+interface DisconnectEvent {
+    eventId: string;
+    clientId: string;
+    index: number;
+    label: string;
+    phone: string | null;
+    reason: string;
+    statusCode: number;
+    timestamp: string;
+}
+
+const disconnectEvents: DisconnectEvent[] = [];
+const lastKnownPhones: Record<string, string> = {};
+const lastDisconnectAlertTime: Record<string, number> = {};
+
+function recordDisconnectEvent(safeId: string, statusCode: number = 401, reason: string = "Session Logged Out or Banned"): DisconnectEvent {
+    const acc = CONFIGURED_ACCOUNTS.find((a) => a.id === safeId) || { id: safeId, index: 1, label: safeId };
+    const phone = lastKnownPhones[safeId] || sessions[safeId]?.phoneNumber || null;
+    const now = Date.now();
+
+    const event: DisconnectEvent = {
+        eventId: `evt_${now}_${safeId}`,
+        clientId: safeId,
+        index: acc.index,
+        label: acc.label,
+        phone,
+        reason,
+        statusCode,
+        timestamp: new Date().toISOString(),
+    };
+
+    // Debounce duplicate events for same account within 60s in the queue
+    const lastAlert = lastDisconnectAlertTime[safeId] || 0;
+    if (now - lastAlert > 60000) {
+        lastDisconnectAlertTime[safeId] = now;
+        disconnectEvents.push(event);
+        if (disconnectEvents.length > 50) {
+            disconnectEvents.shift();
+        }
+        console.warn(`[${safeId}] 🚨 Recorded disconnect event for ${acc.label} (${phone || "no phone"}): ${reason} (code: ${statusCode})`);
+    }
+
+    return event;
+}
+
 // ---------- Client ID Sanitization & Aliasing ----------
 function sanitizeClientId(rawId: any): string {
     const raw = String(rawId || clientId || "user").trim();
@@ -519,6 +565,9 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
                     const rawJid = sock.user.id || "";
                     const num = rawJid.split(":")[0] || rawJid.split("@")[0] || "";
                     entry.phoneNumber = num ? `+${num}` : undefined;
+                    if (entry.phoneNumber) {
+                        lastKnownPhones[safeId] = entry.phoneNumber;
+                    }
                     entry.pushName = sock.user.name || undefined;
                     console.log(`[${safeId}] Phone: ${entry.phoneNumber || "Unknown"} (${entry.pushName || "No Name"})`);
                 }
@@ -536,8 +585,9 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
             const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
             console.warn(`[${safeId}] Connection closed with status code: ${statusCode}`);
 
-            if (statusCode === DisconnectReason.loggedOut) {
-                console.warn(`[${safeId}] Logged out. Clearing credentials...`);
+            if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
+                console.warn(`[${safeId}] 🚨 Logged out (401 Unauthorized / DisconnectReason.loggedOut). Clearing credentials...`);
+                recordDisconnectEvent(safeId, 401, "Session Logged Out or Banned");
                 const failureListeners = [...entry.authFailureListeners];
                 entry.authFailureListeners = [];
                 failureListeners.forEach((fn) => fn(new Error("Logged out from WhatsApp")));
@@ -649,7 +699,7 @@ app.get("/sessions", (req, res) => {
             label: acc.label,
             isReady,
             status,
-            phone: phone || null,
+            phone: phone || lastKnownPhones[acc.id] || null,
             name: name || null,
             connectedAt: entry?.connectedAt || null,
             hasAuthFolder,
@@ -700,6 +750,45 @@ app.get("/proxy-test", async (req, res) => {
         latencyMs: probe.latencyMs || null,
         error: probe.error || null,
         timestamp: new Date().toISOString(),
+    });
+});
+
+// ---------- Real-Time Disconnect Events API for Push Alerts ----------
+app.get("/disconnect-events", (req, res) => {
+    const since = req.query.since ? String(req.query.since) : undefined;
+    const ack = req.query.ack === "true" || req.query.ack === "1";
+
+    let events = [...disconnectEvents];
+    if (since) {
+        events = events.filter((e) => e.timestamp > since);
+    }
+
+    if (ack) {
+        disconnectEvents.length = 0;
+    }
+
+    res.json({
+        events,
+        unhandledCount: disconnectEvents.length,
+        timestamp: new Date().toISOString(),
+    });
+});
+
+app.post("/disconnect-events/ack", (req, res) => {
+    const eventIds: string[] = Array.isArray(req.body.eventIds) ? req.body.eventIds : [];
+    if (eventIds.length > 0) {
+        const idSet = new Set(eventIds);
+        for (let i = disconnectEvents.length - 1; i >= 0; i--) {
+            if (idSet.has(disconnectEvents[i].eventId)) {
+                disconnectEvents.splice(i, 1);
+            }
+        }
+    } else {
+        disconnectEvents.length = 0;
+    }
+    res.json({
+        success: true,
+        remainingCount: disconnectEvents.length,
     });
 });
 

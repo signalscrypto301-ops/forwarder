@@ -3,7 +3,7 @@ import time
 import asyncio
 from collections import defaultdict
 import requests
-from aiogram.types import Message, ParseMode
+from aiogram.types import Message, ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 
 try:
     import aiohttp
@@ -27,6 +27,9 @@ _watchdog_last_reconnect_at: float = 0.0   # last time we called /createsession 
 _watchdog_account_failures: dict[str, int] = defaultdict(int)
 _watchdog_account_outage_start: dict[str, float | None] = defaultdict(lambda: None)
 _watchdog_account_reconnect_at: dict[str, float] = defaultdict(float)
+
+_last_logout_alert_time: dict[str, float] = defaultdict(float)
+LOGOUT_ALERT_COOLDOWN = 300  # 5 minutes debounce per account
 
 WATCHDOG_CHECK_INTERVAL = 5 * 60        # ping /health every 5 minutes
 WATCHDOG_FAILURE_THRESHOLD = 3          # raise alert after this many consecutive failures
@@ -374,6 +377,132 @@ async def scheduled_session_watchdog_loop():
             logger.error(f"[Watchdog] Unexpected error in watchdog loop: {e}", exc_info=True)
 
         await asyncio.sleep(interval)
+
+
+async def send_instant_logout_alert(
+    account_id: str,
+    phone: str | None = None,
+    reason: str = "Session Logged Out or Banned",
+) -> bool:
+    """
+    Immediately dispatches a high-priority Telegram push alert to all admin IDs
+    when an account experiences a 401 Unauthorized or session logout.
+    Includes an interactive inline button: [ 🔑 Generate New QR Code ] for one-tap recovery.
+    """
+    bot_mod = _get_bot_module()
+    bot_instance = getattr(bot_mod, "bot", None)
+    pool = getattr(bot_mod, "account_pool", None)
+
+    canon_id = pool.resolve_account_id(account_id) if pool else ("user" if account_id in ("1", "user") else account_id)
+    now = time.time()
+
+    last_alert = _last_logout_alert_time[canon_id]
+    cooldown = getattr(bot_mod, "LOGOUT_ALERT_COOLDOWN", LOGOUT_ALERT_COOLDOWN) if bot_mod else LOGOUT_ALERT_COOLDOWN
+    if now - last_alert < cooldown:
+        logger.debug(f"[Watchdog] Logout alert for {canon_id} debounced ({int(now - last_alert)}s ago).")
+        return False
+
+    _last_logout_alert_time[canon_id] = now
+    if bot_mod and hasattr(bot_mod, "_last_logout_alert_time"):
+        bot_mod._last_logout_alert_time[canon_id] = now
+
+    # 1. Immediately mark account degraded in the pool so traffic shifts away
+    if pool:
+        pool.mark_degraded(canon_id, cooldown_sec=3600)
+        if canon_id in pool._accounts:
+            pool._accounts[canon_id]["is_ready"] = False
+            pool._accounts[canon_id]["status"] = "logged_out"
+
+    acc_index = ID_TO_INDEX.get(canon_id, 1)
+    short_label = f"Account {acc_index}" if canon_id != "user" else "Account 1"
+
+    # 2. Resolve phone number
+    phone_val = phone
+    if not phone_val and pool:
+        phone_val = pool.get_account_info(canon_id).get("phone")
+    phone_str = f" ({phone_val})" if phone_val else ""
+
+    # 3. Compute active siblings traffic shift
+    if pool:
+        siblings_str = pool.format_active_siblings_string(canon_id)
+    else:
+        siblings_str = "Account 1"
+
+    # 4. Construct inline keyboard for one-tap recovery
+    keyboard = InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        InlineKeyboardButton(
+            text="🔑 Generate New QR Code",
+            callback_data=f"cb:acc:login:{acc_index}",
+        )
+    )
+
+    alert_text = (
+        f"🚨 <b>URGENT: WhatsApp {short_label}{phone_str} was logged out!</b>\n\n"
+        f"Traffic has been safely shifted to <b>{siblings_str}</b>."
+    )
+
+    logger.error(
+        f"[Watchdog] 🚨 PUSH ALERT: WhatsApp {short_label}{phone_str} was logged out. Traffic shifted to {siblings_str}."
+    )
+
+    if bot_instance:
+        for admin_id in config.admin_ids:
+            try:
+                await bot_instance.send_message(
+                    admin_id,
+                    alert_text,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            except Exception as e:
+                logger.error(f"[Watchdog] Failed to send instant logout alert to admin {admin_id}: {e}")
+
+    return True
+
+
+async def scheduled_instant_disconnect_watchdog_loop():
+    """
+    Sub-second / real-time poller that checks for 401 disconnect events
+    from the WhatsApp microservice every 1.5 seconds.
+    """
+    await asyncio.sleep(5)  # allow WhatsApp and bot to initialize
+    logger.info("[Watchdog] Instant disconnect push alert loop started (polling interval: 1.5s).")
+
+    while True:
+        try:
+            bot_mod = _get_bot_module()
+            get_session_fn = getattr(bot_mod, "get_http_session", get_http_session) if bot_mod else get_http_session
+            session = await get_session_fn()
+            url = f"{config.whatsapp_service}/disconnect-events?ack=true"
+
+            events = []
+            if session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as res:
+                    if res.status == 200:
+                        data = await res.json()
+                        events = data.get("events", [])
+            else:
+                def _sync_get():
+                    return requests.get(url, headers=get_http_headers(), timeout=5)
+                r = await asyncio.to_thread(_sync_get)
+                if r.status_code == 200:
+                    events = r.json().get("events", [])
+
+            if events and isinstance(events, list):
+                for ev in events:
+                    acc_id = ev.get("clientId", "user")
+                    phone = ev.get("phone")
+                    reason = ev.get("reason", "Session Logged Out or Banned")
+                    alert_fn = getattr(bot_mod, "send_instant_logout_alert", send_instant_logout_alert) if bot_mod else send_instant_logout_alert
+                    await alert_fn(acc_id, phone=phone, reason=reason)
+
+            await asyncio.sleep(1.5)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug(f"[Watchdog] Instant disconnect poller error: {e}")
+            await asyncio.sleep(2.0)
 
 
 async def cmd_watchdog(message: Message):
