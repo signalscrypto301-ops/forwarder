@@ -135,6 +135,12 @@ async def retry_all_failed_messages() -> tuple[int, int]:
             )
             continue
 
+        if getattr(config, "BAN_AUDIO_FORWARDING", True) and content_type in ("audio", "voice"):
+            logger.info(
+                f"🚫 [Audio Ban] Skipping DLQ retry for audio item {item_id} (audio forwarding is banned)."
+            )
+            continue
+
         if content_type != "text" and (not media_path or not os.path.exists(media_path)):
             logger.warning(
                 f"DLQ item {item_id} ({content_type}) cannot be retried: media file not available."

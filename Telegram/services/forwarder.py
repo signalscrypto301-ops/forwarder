@@ -75,6 +75,23 @@ VIDEO_EXTENSIONS = {
     ".mpeg",
 }
 
+AUDIO_EXTENSIONS = {
+    ".mp3",
+    ".m4a",
+    ".wav",
+    ".ogg",
+    ".oga",
+    ".opus",
+    ".flac",
+    ".aac",
+    ".wma",
+    ".aiff",
+    ".alac",
+    ".mid",
+    ".midi",
+}
+
+
 
 from bot_context import get_bot_module as _get_bot_module
 
@@ -469,6 +486,16 @@ async def send_to_single_group(
         ):
             logger.info(
                 f"🚫 [Video Ban] Refusing to forward video message ({content_type}) to group {group}."
+            )
+            return False
+
+    if getattr(config, "BAN_AUDIO_FORWARDING", True):
+        if content_type in ("audio", "voice") or (
+            downloaded_media
+            and any(downloaded_media.lower().endswith(ext) for ext in AUDIO_EXTENSIONS)
+        ):
+            logger.info(
+                f"🚫 [Audio Ban] Refusing to forward audio message ({content_type}) to group {group}."
             )
             return False
 
@@ -881,6 +908,36 @@ def is_video_message(message: types.Message) -> bool:
     return False
 
 
+def is_audio_message(message: types.Message) -> bool:
+    """
+    Checks if a Telegram message is an audio file, voice note, or document containing audio.
+    """
+    if getattr(message, "audio", None) is not None:
+        return True
+    if getattr(message, "voice", None) is not None:
+        return True
+    c_type = getattr(message, "content_type", None)
+    if c_type in (
+        getattr(ContentType, "AUDIO", "audio"),
+        getattr(ContentType, "VOICE", "voice"),
+        "audio",
+        "voice",
+    ):
+        return True
+
+    doc = getattr(message, "document", None)
+    if doc:
+        mime = (getattr(doc, "mime_type", "") or "").lower()
+        if mime.startswith("audio/"):
+            return True
+        fname = (getattr(doc, "file_name", "") or "").lower()
+        ext = os.path.splitext(fname)[1]
+        if ext in AUDIO_EXTENSIONS:
+            return True
+
+    return False
+
+
 async def handle_channel_post(message: types.Message):
     channel_id = clean_id(message.chat.id)
     bot_mod = _get_bot_module()
@@ -894,6 +951,13 @@ async def handle_channel_post(message: types.Message):
     if getattr(config, "BAN_VIDEO_FORWARDING", True) and is_video_message(message):
         logger.info(
             f"🚫 [Video Ban] Message {getattr(message, 'message_id', 'unknown')} in channel {channel_id} contains video (type={getattr(message, 'content_type', 'unknown')}). Forwarding is banned. Dropping post."
+        )
+        return
+
+    # Ban audio forwarding: if any message has audio attached or is pure audio/voice, do not forward
+    if getattr(config, "BAN_AUDIO_FORWARDING", True) and is_audio_message(message):
+        logger.info(
+            f"🚫 [Audio Ban] Message {getattr(message, 'message_id', 'unknown')} in channel {channel_id} contains audio (type={getattr(message, 'content_type', 'unknown')}). Forwarding is banned. Dropping post."
         )
         return
 
@@ -1084,6 +1148,16 @@ async def handle_channel_post(message: types.Message):
                     )
                     return
 
+            if getattr(config, "BAN_AUDIO_FORWARDING", True) and doc:
+                mime = (getattr(doc, "mime_type", "") or "").lower()
+                fname = (getattr(doc, "file_name", "") or "").lower()
+                ext = os.path.splitext(fname)[1]
+                if mime.startswith("audio/") or ext in AUDIO_EXTENSIONS:
+                    logger.info(
+                        f"🚫 [Audio Ban] Document '{fname}' ({mime}) in channel {channel_id} is audio. Audio forwarding is banned. Skipping."
+                    )
+                    return
+
             raw_caption = message.caption or ""
             entities = message.caption_entities or []
             allow_caption = await should_forward_caption(
@@ -1174,6 +1248,12 @@ async def handle_channel_post(message: types.Message):
             "voice",
             "audio",
         ):
+            if getattr(config, "BAN_AUDIO_FORWARDING", True):
+                logger.info(
+                    f"🚫 [Audio Ban] Audio/Voice message in channel {channel_id} detected. Audio forwarding is banned. Skipping."
+                )
+                return
+
             raw_caption = message.caption or ""
             entities = message.caption_entities or []
             allow_caption = await should_forward_caption(

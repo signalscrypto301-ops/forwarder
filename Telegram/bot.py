@@ -118,6 +118,8 @@ from services.forwarder import (
     send_to_single_group,
     is_video_message,
     VIDEO_EXTENSIONS,
+    is_audio_message,
+    AUDIO_EXTENSIONS,
     handle_channel_post,
     handle_edited_channel_post,
     delete_forwarded_post,

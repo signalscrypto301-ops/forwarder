@@ -6,6 +6,8 @@ settings:
   API_HASH: "your_telethon_api_hash"
   api_secret: "change_this_to_a_secure_random_secret_token"
   ban_video_forwarding: true  # Completely ban forwarding of videos (pure videos, video captions, video notes, video docs)
+  ban_audio_forwarding: true  # Completely ban forwarding of audio (audio files, voice notes, audio docs)
+
 
 
 rate_limits:

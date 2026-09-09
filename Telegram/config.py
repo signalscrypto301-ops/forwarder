@@ -58,4 +58,10 @@ BAN_VIDEO_FORWARDING = os.getenv(
     "BAN_VIDEO_FORWARDING", str(settings.get("ban_video_forwarding", True))
 ).strip().lower() in ("true", "1", "yes")
 
+# Audio Forwarding Policy: True = completely ban audio/voice forwarding
+BAN_AUDIO_FORWARDING = os.getenv(
+    "BAN_AUDIO_FORWARDING", str(settings.get("ban_audio_forwarding", True))
+).strip().lower() in ("true", "1", "yes")
+
+
 
