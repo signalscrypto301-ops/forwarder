@@ -2717,7 +2717,8 @@ async def handle_channel_post(message: types.Message):
             )
 
             photo = message.photo[-1]
-            photo_path = os.path.join(MEDIA_DIR, f"{photo.file_unique_id}.jpg")
+            unique_tag = f"{int(time.time() * 1000)}_{random.randint(100, 999)}"
+            photo_path = os.path.join(MEDIA_DIR, f"{photo.file_unique_id}_{unique_tag}.jpg")
             original_filename = f"{photo.file_unique_id}.jpg"
 
             try:
