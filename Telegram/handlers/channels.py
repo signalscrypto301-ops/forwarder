@@ -17,6 +17,10 @@ from database import (
     set_all_channels_paused,
     get_channel_details,
     get_channels_overview,
+    unlink_channel,
+    deactivate_channel,
+    activate_channel,
+    delete_group_for_channel,
 )
 
 
@@ -144,8 +148,8 @@ def build_channel_detail_keyboard(channel_id: str, page: int = 1) -> tuple[str, 
     groups = details["groups"]
     last_post = details.get("last_post_at") or "None (No activity logged)"
 
-    status_badge = "⏸️ PAUSED (Forwarding Suspended)" if paused else "🟢 ACTIVE (Forwarding Enabled)"
-    toggle_btn_text = "▶️ Resume Forwarding" if paused else "⏸️ Pause Forwarding"
+    status_badge = "⏸️ PAUSED / DEACTIVATED (Forwarding Paused)" if paused else "🟢 ACTIVE (Forwarding Running)"
+    toggle_btn_text = "▶️ Activate Channel (Resume Forwarding)" if paused else "⏸️ Deactivate Channel (Pause Forwarding)"
     toggle_action = "unpause" if paused else "pause"
 
     groups_text = ""
@@ -182,12 +186,19 @@ def build_channel_detail_keyboard(channel_id: str, page: int = 1) -> tuple[str, 
     )
 
     if groups:
+        if len(groups) > 1:
+            keyboard.add(
+                IKB(
+                    text=f"🔗 Unlink All Destinations ({len(groups)})",
+                    callback_data=f"cb:unlink_all_confirm:{channel_id}:{page}",
+                )
+            )
         for g in groups:
             kind = "📢" if "@newsletter" in g else "👥"
             short_g = (g[:18] + "...") if len(g) > 21 else g
             keyboard.add(
                 IKB(
-                    text=f"❌ Unmap {kind} {short_g}",
+                    text=f"🔗 Unlink {kind} {short_g}",
                     callback_data=f"u:{channel_id}:{g}",
                 )
             )
@@ -200,6 +211,34 @@ def build_channel_detail_keyboard(channel_id: str, page: int = 1) -> tuple[str, 
         IKB(
             text="◀️ Back to Channels",
             callback_data=f"cb:page:{page}",
+        ),
+    )
+    return text, keyboard
+
+
+def build_unlink_confirm_keyboard(channel_id: str, page: int = 1) -> tuple[str, InlineKeyboardMarkup]:
+    """
+    Builds a confirmation dialog before unlinking all mapped WhatsApp destinations from a channel.
+    """
+    IKM = _get_ikm()
+    IKB = _get_ikb()
+    details = get_channel_details(channel_id)
+    groups_count = len(details.get("groups", []))
+    text = (
+        f"⚠️ <b>Confirm Unlink All Destinations</b>\n\n"
+        f"Are you sure you want to unlink all <code>{groups_count}</code> WhatsApp destination(s) from channel <code>{channel_id}</code>?\n\n"
+        "• The channel will remain registered in your monitored list.\n"
+        "• No messages will be forwarded until you map new destinations."
+    )
+    keyboard = IKM(row_width=2)
+    keyboard.row(
+        IKB(
+            text=f"🔗 Yes, Unlink All ({groups_count})",
+            callback_data=f"cb:unlink_all_exec:{channel_id}:{page}",
+        ),
+        IKB(
+            text="❌ Cancel",
+            callback_data=f"cb:view:{channel_id}:{page}",
         ),
     )
     return text, keyboard
@@ -264,6 +303,142 @@ async def resume_all_command(message: Message):
     )
 
 
+async def deactivate_channel_command(message: Message):
+    if not message.chat.type == "private" or not _is_admin(message.from_user.id):
+        return
+
+    args = message.get_args()
+    if not args:
+        overview = get_channels_overview()
+        active = [c for c in overview if not c["is_paused"]]
+        if not active:
+            await message.reply(
+                "⏸️ <b>Deactivate Channel Forwarding</b>\n\n"
+                "All channels are currently paused.\n"
+                "Usage: <code>/deactivate &lt;channel_id&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        text = (
+            "⏸️ <b>Deactivate Channel Forwarding</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Specify a channel ID to pause forwarding:\n"
+            "<code>/deactivate &lt;channel_id&gt;</code>\n\n"
+            "<b>Active Channels:</b>\n"
+        )
+        for item in active[:10]:
+            text += f"• <code>{item['channel_id']}</code> ({item['group_count']} groups)\n"
+        if len(active) > 10:
+            text += f"\n<i>...and {len(active) - 10} more channels. Use /channels to view all.</i>"
+        await message.reply(text, parse_mode=ParseMode.HTML)
+        return
+
+    channel_id = clean_id(args.strip())
+    set_channel_paused(channel_id, True)
+    await message.reply(
+        f"⏸️ <b>Channel Deactivated</b>\n\n"
+        f"Forwarding for channel <code>{channel_id}</code> is now <b>PAUSED</b>.\n"
+        "Posts from this channel will NOT be forwarded to WhatsApp.\n\n"
+        f"Use <code>/activate {channel_id}</code> or /channels to restore forwarding.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def activate_channel_command(message: Message):
+    if not message.chat.type == "private" or not _is_admin(message.from_user.id):
+        return
+
+    args = message.get_args()
+    if not args:
+        overview = get_channels_overview()
+        paused = [c for c in overview if c["is_paused"]]
+        if not paused:
+            await message.reply(
+                "▶️ <b>Activate Channel Forwarding</b>\n\n"
+                "All channels are currently active.\n"
+                "Usage: <code>/activate &lt;channel_id&gt;</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        text = (
+            "▶️ <b>Activate Channel Forwarding</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Specify a channel ID to resume forwarding:\n"
+            "<code>/activate &lt;channel_id&gt;</code>\n\n"
+            "<b>Paused Channels:</b>\n"
+        )
+        for item in paused[:10]:
+            text += f"• <code>{item['channel_id']}</code> ({item['group_count']} groups)\n"
+        if len(paused) > 10:
+            text += f"\n<i>...and {len(paused) - 10} more channels. Use /channels to view all.</i>"
+        await message.reply(text, parse_mode=ParseMode.HTML)
+        return
+
+    channel_id = clean_id(args.strip())
+    set_channel_paused(channel_id, False)
+    await message.reply(
+        f"▶️ <b>Channel Activated</b>\n\n"
+        f"Forwarding for channel <code>{channel_id}</code> is now <b>ACTIVE</b>.\n"
+        "Posts from this channel will be forwarded to mapped WhatsApp destinations.\n\n"
+        f"Use <code>/deactivate {channel_id}</code> or /channels to pause forwarding.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def unlink_command(message: Message):
+    if not message.chat.type == "private" or not _is_admin(message.from_user.id):
+        return
+
+    args = message.get_args()
+    if not args:
+        await message.reply(
+            "🔗 <b>Unlink Channel Destinations</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n"
+            "Remove WhatsApp destination mapping(s) from a Telegram channel.\n\n"
+            "<b>Usage:</b>\n"
+            "• <code>/unlink &lt;channel_id&gt;</code> - Unlink ALL WhatsApp destinations from this channel\n"
+            "• <code>/unlink &lt;channel_id&gt; &lt;group_id&gt;</code> - Unlink a specific WhatsApp group/newsletter\n\n"
+            "💡 <i>Tip: The channel remains registered in your bot. Use /channels to manage interactively.</i>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    parts = args.strip().split(maxsplit=1)
+    channel_id = clean_id(parts[0])
+
+    if len(parts) >= 2:
+        group_id = parts[1].strip()
+        count = await asyncio.to_thread(unlink_channel, channel_id, group_id)
+        if count > 0:
+            await message.reply(
+                f"🔗 <b>Destination Unlinked</b>\n\n"
+                f"Removed WhatsApp destination <code>{group_id}</code> from channel <code>{channel_id}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.reply(
+                f"⚠️ Destination <code>{group_id}</code> was not mapped to channel <code>{channel_id}</code>.",
+                parse_mode=ParseMode.HTML,
+            )
+    else:
+        count = await asyncio.to_thread(unlink_channel, channel_id)
+        if count > 0:
+            await message.reply(
+                f"🔗 <b>Channel Unlinked</b>\n\n"
+                f"Unlinked all <code>{count}</code> WhatsApp destination(s) from channel <code>{channel_id}</code>.\n"
+                "The channel remains registered in your monitored channels list.\n\n"
+                f"Use <code>/map {channel_id}</code> or /channels to assign new destinations.",
+                parse_mode=ParseMode.HTML,
+            )
+        else:
+            await message.reply(
+                f"ℹ️ Channel <code>{channel_id}</code> has no mapped WhatsApp destinations to unlink.",
+                parse_mode=ParseMode.HTML,
+            )
+
+
 async def add_channel_command(message: Message):
     if not message.chat.type == "private" or not _is_admin(message.from_user.id):
         return
@@ -312,6 +487,7 @@ async def handle_channels_callbacks(call: CallbackQuery):
     build_ch_kb = getattr(bot_mod, "build_channels_keyboard", build_channels_keyboard) if bot_mod else build_channels_keyboard
     build_det_kb = getattr(bot_mod, "build_channel_detail_keyboard", build_channel_detail_keyboard) if bot_mod else build_channel_detail_keyboard
     build_del_kb = getattr(bot_mod, "build_delete_confirm_keyboard", build_delete_confirm_keyboard) if bot_mod else build_delete_confirm_keyboard
+    build_unl_kb = getattr(bot_mod, "build_unlink_confirm_keyboard", build_unlink_confirm_keyboard) if bot_mod else build_unlink_confirm_keyboard
 
     parts = data.split(":")
     action = parts[1] if len(parts) > 1 else ""
@@ -343,9 +519,42 @@ async def handle_channels_callbacks(call: CallbackQuery):
         new_paused = (subaction == "pause")
         set_channel_paused(cid, new_paused)
 
-        toast = f"⏸️ Channel {cid} paused!" if new_paused else f"▶️ Channel {cid} resumed!"
+        toast = f"⏸️ Channel {cid} deactivated!" if new_paused else f"▶️ Channel {cid} activated!"
         await call.answer(toast, show_alert=False)
 
+        text, kb = build_det_kb(cid, page)
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    elif action == "unlink_one":
+        cid = parts[2] if len(parts) > 2 else ""
+        gid = parts[3] if len(parts) > 3 else ""
+        page = int(parts[4]) if len(parts) > 4 and parts[4].isdigit() else 1
+        delete_group_for_channel(cid, gid)
+        await call.answer(f"🔗 Unlinked {gid}!", show_alert=False)
+        text, kb = build_det_kb(cid, page)
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+
+    elif action == "unlink_all_confirm":
+        cid = parts[2] if len(parts) > 2 else ""
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+        text, kb = build_unl_kb(cid, page)
+        try:
+            await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
+        except Exception:
+            pass
+        await call.answer()
+
+    elif action == "unlink_all_exec":
+        cid = parts[2] if len(parts) > 2 else ""
+        page = int(parts[3]) if len(parts) > 3 and parts[3].isdigit() else 1
+        count = unlink_channel(cid)
+        await call.answer(f"🔗 Unlinked all {count} destinations!", show_alert=True)
         text, kb = build_det_kb(cid, page)
         try:
             await call.message.edit_text(text, reply_markup=kb, parse_mode=ParseMode.HTML)
@@ -409,6 +618,9 @@ def register_channels_handlers(dp):
     dp.register_message_handler(channels_command, commands=["channels", "menu"])
     dp.register_message_handler(pause_all_command, commands=["pause_all", "freeze_all"])
     dp.register_message_handler(resume_all_command, commands=["resume_all", "unfreeze_all"])
+    dp.register_message_handler(deactivate_channel_command, commands=["deactivate", "pause"])
+    dp.register_message_handler(activate_channel_command, commands=["activate", "resume", "unpause"])
+    dp.register_message_handler(unlink_command, commands=["unlink", "unmap"])
     dp.register_message_handler(add_channel_command, commands=["add_channel"])
     dp.register_message_handler(delete_channel_command, commands=["delete_channel"])
     dp.register_callback_query_handler(
@@ -419,6 +631,9 @@ def register_channels_handlers(dp):
             or c.data.startswith("cb:page:")
             or c.data.startswith("cb:view:")
             or c.data.startswith("cb:toggle:")
+            or c.data.startswith("cb:unlink_one:")
+            or c.data.startswith("cb:unlink_all_confirm:")
+            or c.data.startswith("cb:unlink_all_exec:")
             or c.data.startswith("cb:del_confirm:")
             or c.data.startswith("cb:del_exec:")
             or c.data.startswith("cb:bulk_pause:")

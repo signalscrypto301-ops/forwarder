@@ -360,29 +360,80 @@ def delete_channel(channel_id):
     connection.close()
 
 
-def is_channel_paused(channel_id: str) -> bool:
-    channel_id = clean_id(channel_id)
+def unlink_channel(channel_id: str, group_id: str | None = None) -> int:
+    """
+    Unlinks destination WhatsApp group(s) from a Telegram channel.
+    - If group_id is specified: removes only that specific mapping.
+    - If group_id is None/omitted: removes all mapped groups for this channel.
+    The channel itself remains registered in the channels table.
+    Returns the number of unlinked group mappings.
+    """
+    channel_id = str(channel_id).strip()
     if not channel_id:
-        return False
+        return 0
+    cid_norm = clean_id(channel_id)
+    cid_raw = channel_id[4:] if channel_id.startswith("-100") else channel_id
     connection = get_connection()
     cursor = connection.cursor()
-    cursor.execute("SELECT is_paused FROM channels WHERE channel_id = ?", (channel_id,))
+    if group_id:
+        gid = str(group_id).strip()
+        cursor.execute(
+            "DELETE FROM channel_groups WHERE (channel_id = ? OR channel_id = ?) AND group_id = ?",
+            (cid_norm, cid_raw, gid),
+        )
+    else:
+        cursor.execute(
+            "DELETE FROM channel_groups WHERE channel_id = ? OR channel_id = ?",
+            (cid_norm, cid_raw),
+        )
+    count = cursor.rowcount
+    connection.commit()
+    connection.close()
+    return count
+
+
+def deactivate_channel(channel_id: str) -> bool:
+    """Deactivates/pauses message forwarding for a specific channel."""
+    set_channel_paused(channel_id, True)
+    return True
+
+
+def activate_channel(channel_id: str) -> bool:
+    """Activates/resumes message forwarding for a specific channel."""
+    set_channel_paused(channel_id, False)
+    return True
+
+
+def is_channel_paused(channel_id: str) -> bool:
+    channel_id = str(channel_id).strip()
+    if not channel_id:
+        return False
+    cid_norm = clean_id(channel_id)
+    cid_raw = channel_id[4:] if channel_id.startswith("-100") else channel_id
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT is_paused FROM channels WHERE channel_id = ? OR channel_id = ?",
+        (cid_norm, cid_raw),
+    )
     row = cursor.fetchone()
     connection.close()
     return bool(row and row[0] == 1)
 
 
 def set_channel_paused(channel_id: str, paused: bool):
-    channel_id = clean_id(channel_id)
+    channel_id = str(channel_id).strip()
     if not channel_id:
         return
-    add_channel(channel_id)
+    cid_norm = clean_id(channel_id)
+    cid_raw = channel_id[4:] if channel_id.startswith("-100") else channel_id
+    add_channel(cid_norm)
     val = 1 if paused else 0
     connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(
-        "UPDATE channels SET is_paused = ? WHERE channel_id = ?",
-        (val, channel_id),
+        "UPDATE channels SET is_paused = ? WHERE channel_id = ? OR channel_id = ?",
+        (val, cid_norm, cid_raw),
     )
     connection.commit()
     connection.close()
