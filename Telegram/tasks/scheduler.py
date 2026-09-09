@@ -9,6 +9,7 @@ from database import (
     get_daily_metrics,
     get_active_channels_count,
     get_stale_channels,
+    prune_old_forwarded_messages,
 )
 from services.whatsapp import _sync_account_pool_now
 from services.forwarder import cleanup_stale_media
@@ -156,6 +157,22 @@ async def scheduled_daily_report_loop():
                         logger.error(
                             f"Failed to dispatch scheduled daily report to admin {admin_id}: {e}"
                         )
+
+            # Daily maintenance: Prune forwarded message mappings older than 14 days
+            try:
+                bot_mod = _get_bot_module()
+                prune_fn = (
+                    getattr(bot_mod, "prune_old_forwarded_messages", prune_old_forwarded_messages)
+                    if bot_mod
+                    else prune_old_forwarded_messages
+                )
+                pruned = await asyncio.to_thread(prune_fn, 14)
+                if pruned > 0:
+                    logger.info(
+                        f"Daily maintenance: Pruned {pruned} expired forwarded message mappings (>14 days)."
+                    )
+            except Exception as e:
+                logger.error(f"Error pruning old forwarded messages: {e}")
         except asyncio.CancelledError:
             break
         except Exception as e:

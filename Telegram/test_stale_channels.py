@@ -36,6 +36,7 @@ from bot import generate_stale_channels_digest, build_channel_detail_keyboard
 
 class TestStaleChannelsDetector(unittest.TestCase):
     def setUp(self):
+        self.orig_db_path = database.DB_PATH
         self.test_db = os.path.join(os.path.dirname(__file__), 'test_stale.db')
         if os.path.exists(self.test_db):
             try:
@@ -46,6 +47,7 @@ class TestStaleChannelsDetector(unittest.TestCase):
         database.create_table()
 
     def tearDown(self):
+        database.DB_PATH = self.orig_db_path
         if os.path.exists(self.test_db):
             try:
                 os.remove(self.test_db)

@@ -19,6 +19,10 @@ from aiogram import types
 from aiogram.types import ContentType, MessageEntity, ParseMode
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+try:
+    from telethon import events
+except ImportError:
+    events = None
 
 import config
 from logger import logger
@@ -30,12 +34,16 @@ from database import (
     add_failed_message,
     update_channel_last_post,
     record_channel_post_activity,
+    record_forwarded_message,
+    get_forwarded_messages,
+    delete_forwarded_message_records,
 )
 from services.whatsapp import (
     get_http_headers,
     get_http_session,
     resolve_group_name,
     notify_admins_auth_required,
+    post_whatsapp_json,
 )
 
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
@@ -123,6 +131,29 @@ async def init_telethon_client():
             if bot_mod:
                 bot_mod.bot_client = client
             logger.info("Telethon MTProto bot client successfully connected.")
+
+            if events and hasattr(client, "on"):
+                try:
+                    @client.on(events.MessageDeleted())
+                    async def on_telethon_message_deleted(event):
+                        try:
+                            chat_id = getattr(event, "chat_id", None)
+                            deleted_ids = getattr(event, "deleted_ids", []) or []
+                            if chat_id is not None and deleted_ids:
+                                ch_str = str(chat_id)
+                                bot_m = _get_bot_module()
+                                del_fn = (
+                                    getattr(bot_m, "delete_forwarded_post", delete_forwarded_post)
+                                    if bot_m
+                                    else delete_forwarded_post
+                                )
+                                for mid in deleted_ids:
+                                    await del_fn(ch_str, mid)
+                        except Exception as del_err:
+                            logger.error(f"Error handling Telethon message deletion: {del_err}")
+                except Exception as reg_err:
+                    logger.debug(f"Failed to register Telethon MessageDeleted handler: {reg_err}")
+
             break
         except Exception as e:
             logger.warning(
@@ -426,6 +457,7 @@ async def send_to_single_group(
     content_type: str = "text",
     channel_id: str | None = None,
     is_retry: bool = False,
+    tg_message_id: int | None = None,
 ) -> bool:
     """
     Sends message to a single WhatsApp group/newsletter.
@@ -571,6 +603,22 @@ async def send_to_single_group(
                             logger.info(
                                 f"Media message sent to group {group} via {sender_id} successfully."
                             )
+                            if channel_id and tg_message_id:
+                                wa_mid = res_json.get("messageId") if isinstance(res_json, dict) else None
+                                wa_key = res_json.get("key") if isinstance(res_json, dict) else None
+                                if wa_mid or wa_key:
+                                    try:
+                                        await asyncio.to_thread(
+                                            record_forwarded_message,
+                                            channel_id,
+                                            tg_message_id,
+                                            group,
+                                            wa_mid,
+                                            wa_key,
+                                            sender_id,
+                                        )
+                                    except Exception as db_err:
+                                        logger.debug(f"Failed to record forwarded message mapping: {db_err}")
                             if rc:
                                 rc.record_sent(account_id=sender_id)
                             await check_and_alert_health(account_id=sender_id)
@@ -665,6 +713,22 @@ async def send_to_single_group(
                             logger.info(
                                 f"Text message sent to group {group} via {sender_id} successfully."
                             )
+                            if channel_id and tg_message_id:
+                                wa_mid = res_json.get("messageId") if isinstance(res_json, dict) else None
+                                wa_key = res_json.get("key") if isinstance(res_json, dict) else None
+                                if wa_mid or wa_key:
+                                    try:
+                                        await asyncio.to_thread(
+                                            record_forwarded_message,
+                                            channel_id,
+                                            tg_message_id,
+                                            group,
+                                            wa_mid,
+                                            wa_key,
+                                            sender_id,
+                                        )
+                                    except Exception as db_err:
+                                        logger.debug(f"Failed to record forwarded message mapping: {db_err}")
                             if rc:
                                 rc.record_sent(account_id=sender_id)
                             await check_and_alert_health(account_id=sender_id)
@@ -843,18 +907,25 @@ async def handle_channel_post(message: types.Message):
         ContentType.DOCUMENT: "doc",
         ContentType.VOICE: "audio",
         ContentType.AUDIO: "audio",
+        "text": "text",
+        "photo": "photo",
+        "video": "video",
+        "document": "doc",
+        "doc": "doc",
+        "voice": "audio",
+        "audio": "audio",
     }
     content_type_str = content_type_map.get(message.content_type, "text")
 
     try:
         # 1. Process Text Messages
-        if message.content_type == ContentType.TEXT:
+        if message.content_type in (getattr(ContentType, "TEXT", None), "text"):
             raw_text = message.text or ""
             entities = message.entities or []
             caption = format_caption_for_whatsapp(raw_text, entities) if raw_text else ""
 
         # 2. Process Photos
-        elif message.content_type == ContentType.PHOTO:
+        elif message.content_type in (getattr(ContentType, "PHOTO", None), "photo"):
             raw_caption = message.caption or ""
             entities = message.caption_entities or []
             allow_caption = await should_forward_caption(
@@ -875,6 +946,11 @@ async def handle_channel_post(message: types.Message):
             try:
                 await photo.download(destination_file=photo_path)
                 if os.path.exists(photo_path) and os.path.getsize(photo_path) > 0:
+                    # Adapt image if forwarding to any WhatsApp channels/newsletters
+                    has_newsletter = any("@newsletter" in g for g in groups)
+                    if has_newsletter:
+                        adapt_fn = getattr(bot_mod, "adapt_image_for_whatsapp_channel", adapt_image_for_whatsapp_channel) if bot_mod else adapt_image_for_whatsapp_channel
+                        photo_path = await asyncio.to_thread(adapt_fn, photo_path)
                     downloaded_media = photo_path
                 else:
                     logger.error(f"Downloaded photo {photo_path} is missing or empty.")
@@ -886,7 +962,7 @@ async def handle_channel_post(message: types.Message):
                     os.remove(photo_path)
 
         # 3. Process Videos
-        elif message.content_type == ContentType.VIDEO:
+        elif message.content_type in (getattr(ContentType, "VIDEO", None), "video"):
             if getattr(config, "BAN_VIDEO_FORWARDING", True):
                 logger.info(
                     f"🚫 [Video Ban] Video message in channel {channel_id} dropped (video forwarding is banned)."
@@ -969,7 +1045,7 @@ async def handle_channel_post(message: types.Message):
                     os.remove(video_file_path)
 
         # 4. Process Documents
-        elif message.content_type == ContentType.DOCUMENT:
+        elif message.content_type in (getattr(ContentType, "DOCUMENT", None), "document", "doc"):
             doc = message.document
             if getattr(config, "BAN_VIDEO_FORWARDING", True) and doc:
                 mime = (getattr(doc, "mime_type", "") or "").lower()
@@ -1055,7 +1131,12 @@ async def handle_channel_post(message: types.Message):
                     os.remove(doc_file_path)
 
         # 5. Process Voice / Audio
-        elif message.content_type in (ContentType.VOICE, ContentType.AUDIO):
+        elif message.content_type in (
+            getattr(ContentType, "VOICE", None),
+            getattr(ContentType, "AUDIO", None),
+            "voice",
+            "audio",
+        ):
             raw_caption = message.caption or ""
             entities = message.caption_entities or []
             allow_caption = await should_forward_caption(
@@ -1131,6 +1212,7 @@ async def handle_channel_post(message: types.Message):
                     original_filename,
                     content_type=content_type_str,
                     channel_id=channel_id,
+                    tg_message_id=getattr(message, "message_id", None),
                 )
                 for group in groups
             )
@@ -1144,6 +1226,168 @@ async def handle_channel_post(message: types.Message):
                 os.remove(downloaded_media)
             except Exception as e:
                 logger.error(f"Failed to remove {downloaded_media}: {e}")
+
+
+async def handle_edited_channel_post(message: types.Message):
+    """
+    Handles edited channel posts and propagates text/caption edits to forwarded WhatsApp messages.
+    """
+    try:
+        channel_id = str(message.chat.id)
+        clean_cid = clean_id(channel_id)
+        tg_message_id = getattr(message, "message_id", None)
+        if not tg_message_id:
+            return
+
+        bot_mod = _get_bot_module()
+        fmt_caption_fn = (
+            getattr(bot_mod, "format_caption_for_whatsapp", format_caption_for_whatsapp)
+            if bot_mod
+            else format_caption_for_whatsapp
+        )
+        post_fn = (
+            getattr(bot_mod, "post_whatsapp_json", post_whatsapp_json)
+            if bot_mod
+            else post_whatsapp_json
+        )
+
+        raw_text = getattr(message, "text", None) or getattr(message, "caption", None) or ""
+        entities = getattr(message, "entities", None) or getattr(message, "caption_entities", None) or []
+        new_text = fmt_caption_fn(raw_text, entities) if raw_text else ""
+
+        if not new_text:
+            logger.debug(
+                f"Edited post {tg_message_id} in channel {channel_id} has empty text/caption. Skipping edit sync."
+            )
+            return
+
+        get_fwd_fn = (
+            getattr(bot_mod, "get_forwarded_messages", get_forwarded_messages)
+            if bot_mod
+            else get_forwarded_messages
+        )
+        records = await asyncio.to_thread(get_fwd_fn, clean_cid, tg_message_id)
+        if not records and str(channel_id) != clean_cid:
+            records = await asyncio.to_thread(get_fwd_fn, str(channel_id), tg_message_id)
+
+        if not records:
+            logger.debug(
+                f"No forwarded WhatsApp messages found to edit for channel {channel_id} post {tg_message_id}."
+            )
+            return
+
+        async def edit_single_target(rec: dict):
+            group_id = rec.get("group_id")
+            wa_key = rec.get("wa_key")
+            sender_id = rec.get("sender_id") or "user"
+            if not group_id or not wa_key:
+                return False
+
+            payload = {
+                "clientId": sender_id,
+                "groupId": group_id,
+                "key": wa_key,
+                "text": new_text,
+            }
+            try:
+                status, res = await post_fn("editMessage", payload)
+                if status == 200:
+                    logger.info(
+                        f"Successfully synced edit for post {channel_id}:{tg_message_id} to group {group_id}."
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        f"Failed to sync edit for post {channel_id}:{tg_message_id} to group {group_id}: {res}"
+                    )
+                    return False
+            except Exception as e:
+                logger.error(f"Error calling editMessage for {group_id}: {e}")
+                return False
+
+        await asyncio.gather(*(edit_single_target(r) for r in records))
+
+    except Exception as e:
+        logger.error(f"Unexpected error handling edited channel post: {e}", exc_info=True)
+
+
+async def delete_forwarded_post(channel_id: str, tg_message_id: int) -> int:
+    """
+    Revokes/deletes forwarded WhatsApp messages corresponding to a Telegram post.
+    Returns the count of successfully revoked messages.
+    """
+    try:
+        clean_cid = clean_id(channel_id)
+        bot_mod = _get_bot_module()
+        get_fwd_fn = (
+            getattr(bot_mod, "get_forwarded_messages", get_forwarded_messages)
+            if bot_mod
+            else get_forwarded_messages
+        )
+        del_recs_fn = (
+            getattr(bot_mod, "delete_forwarded_message_records", delete_forwarded_message_records)
+            if bot_mod
+            else delete_forwarded_message_records
+        )
+        post_fn = (
+            getattr(bot_mod, "post_whatsapp_json", post_whatsapp_json)
+            if bot_mod
+            else post_whatsapp_json
+        )
+
+        records = await asyncio.to_thread(get_fwd_fn, clean_cid, tg_message_id)
+        if not records and str(channel_id) != clean_cid:
+            records = await asyncio.to_thread(get_fwd_fn, str(channel_id), tg_message_id)
+
+        if not records:
+            logger.debug(
+                f"No forwarded WhatsApp messages found to delete for channel {channel_id} post {tg_message_id}."
+            )
+            return 0
+
+        async def delete_single_target(rec: dict):
+            group_id = rec.get("group_id")
+            wa_key = rec.get("wa_key")
+            sender_id = rec.get("sender_id") or "user"
+            if not group_id or not wa_key:
+                return False
+
+            payload = {
+                "clientId": sender_id,
+                "groupId": group_id,
+                "key": wa_key,
+            }
+            try:
+                status, res = await post_fn("deleteMessage", payload)
+                if status == 200:
+                    logger.info(
+                        f"Successfully revoked WhatsApp message in {group_id} for TG post {channel_id}:{tg_message_id}."
+                    )
+                    return True
+                else:
+                    logger.warning(
+                        f"Failed to revoke WhatsApp message in {group_id}: {res}"
+                    )
+                    return False
+            except Exception as e:
+                logger.error(f"Error calling deleteMessage for {group_id}: {e}")
+                return False
+
+        results = await asyncio.gather(*(delete_single_target(r) for r in records))
+        deleted_count = sum(1 for r in results if r)
+
+        try:
+            await asyncio.to_thread(del_recs_fn, clean_cid, tg_message_id)
+            if str(channel_id) != clean_cid:
+                await asyncio.to_thread(del_recs_fn, str(channel_id), tg_message_id)
+        except Exception as db_err:
+            logger.debug(f"Failed to delete forwarded message records: {db_err}")
+
+        return deleted_count
+
+    except Exception as e:
+        logger.error(f"Unexpected error in delete_forwarded_post: {e}", exc_info=True)
+        return 0
 
 
 def register_forwarder_handlers(dp):
@@ -1160,3 +1404,17 @@ def register_forwarder_handlers(dp):
             ContentType.AUDIO,
         ],
     )
+    if hasattr(dp, "register_edited_channel_post_handler"):
+        dp.register_edited_channel_post_handler(
+            handle_edited_channel_post,
+            content_types=[
+                ContentType.TEXT,
+                ContentType.PHOTO,
+                ContentType.VIDEO,
+                getattr(ContentType, "VIDEO_NOTE", "video_note"),
+                getattr(ContentType, "ANIMATION", "animation"),
+                ContentType.DOCUMENT,
+                ContentType.VOICE,
+                ContentType.AUDIO,
+            ],
+        )

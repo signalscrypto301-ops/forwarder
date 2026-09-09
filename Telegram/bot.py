@@ -119,6 +119,8 @@ from services.forwarder import (
     is_video_message,
     VIDEO_EXTENSIONS,
     handle_channel_post,
+    handle_edited_channel_post,
+    delete_forwarded_post,
     register_forwarder_handlers,
 )
 

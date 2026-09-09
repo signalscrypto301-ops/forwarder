@@ -1220,6 +1220,7 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
         if (!entry) return;
 
         const jid = formatJid(groupId);
+        let sendResult: any = undefined;
         if (file) {
             const mimeType = (mime.lookup(file.originalname || file.path) || file.mimetype || "") as string;
             const isVideoExt = /\.(mp4|mov|avi|mkv|webm|flv|wmv|m4v|3gp|ts|m4p|mpg|mpeg)$/i.test(file.originalname || file.path);
@@ -1228,12 +1229,12 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
                 return res.status(403).json({ message: "Video forwarding is banned" });
             }
             const payload = await buildMediaPayload(file.path, file.originalname, caption);
-            await enqueueSocketSend(targetId, async () => {
+            sendResult = await enqueueSocketSend(targetId, async () => {
                 await simulateTypingPresence(targetId, entry.sock!, jid, { isMedia: true, textForDelay: caption });
                 return await entry.sock!.sendMessage(jid, payload);
             });
         } else if (caption) {
-            await enqueueSocketSend(targetId, async () => {
+            sendResult = await enqueueSocketSend(targetId, async () => {
                 await simulateTypingPresence(targetId, entry.sock!, jid, { textForDelay: String(caption) });
                 return await entry.sock!.sendMessage(jid, { text: String(caption) });
             });
@@ -1245,7 +1246,11 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
             registerKnownNewsletter(jid);
         }
 
-        res.json({ message: "Message sent successfully" });
+        res.json({
+            message: "Message sent successfully",
+            messageId: sendResult?.key?.id,
+            key: sendResult?.key,
+        });
     } catch (error: any) {
         console.error(`[${targetId}] Error sending message:`, error);
         res.status(500).json({
@@ -1276,14 +1281,18 @@ app.post("/sendText", async (req, res) => {
 
     try {
         const jid = formatJid(groupId);
-        await enqueueSocketSend(targetId, async () => {
+        const sendResult = await enqueueSocketSend(targetId, async () => {
             await simulateTypingPresence(targetId, entry.sock!, jid, { textForDelay: String(text) });
             return await entry.sock!.sendMessage(jid, { text: String(text) });
         });
         if (jid.endsWith("@newsletter")) {
             registerKnownNewsletter(jid);
         }
-        res.json({ message: "Text message sent successfully" });
+        res.json({
+            message: "Text message sent successfully",
+            messageId: sendResult?.key?.id,
+            key: sendResult?.key,
+        });
     } catch (error: any) {
         console.error(`[${targetId}] Error sending text message:`, error);
         res.status(500).json({
@@ -1316,7 +1325,7 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
         const jid = formatJid(groupId);
 
         const payload = await buildMediaPayload(file.path, file.originalname, caption);
-        await enqueueSocketSend(targetId, async () => {
+        const sendResult = await enqueueSocketSend(targetId, async () => {
             await simulateTypingPresence(targetId, entry.sock!, jid, { isMedia: true, textForDelay: caption });
             return await entry.sock!.sendMessage(jid, payload);
         });
@@ -1325,7 +1334,11 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
             registerKnownNewsletter(jid);
         }
 
-        res.json({ message: "Media message sent successfully" });
+        res.json({
+            message: "Media message sent successfully",
+            messageId: sendResult?.key?.id,
+            key: sendResult?.key,
+        });
     } catch (error: any) {
         console.error(`[${targetId}] Error sending media message:`, error);
         res.status(500).json({
@@ -1340,6 +1353,96 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
                 console.error("Error cleaning up upload file:", err);
             }
         }
+    }
+});
+
+app.post("/editMessage", async (req, res) => {
+    const targetId = sanitizeClientId(req.body.clientId || clientId);
+    const { groupId, text, key, messageId } = req.body;
+
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
+
+    if (!groupId || !text || (!key && !messageId)) {
+        return res.status(400).json({ message: "groupId, text, and key (or messageId) are required" });
+    }
+
+    try {
+        const jid = formatJid(groupId);
+        let messageKey: any = key;
+        if (typeof key === "string") {
+            try {
+                messageKey = JSON.parse(key);
+            } catch (_) {
+                messageKey = { remoteJid: jid, id: key, fromMe: true };
+            }
+        }
+        if (!messageKey && messageId) {
+            messageKey = { remoteJid: jid, id: messageId, fromMe: true };
+        }
+
+        const editResult = await enqueueSocketSend(targetId, async () => {
+            return await entry.sock!.sendMessage(jid, {
+                text: String(text),
+                edit: messageKey,
+            });
+        });
+
+        res.json({
+            message: "Message edited successfully",
+            messageId: editResult?.key?.id || messageKey?.id,
+            key: editResult?.key || messageKey,
+        });
+    } catch (error: any) {
+        console.error(`[${targetId}] Error editing message in ${groupId}:`, error);
+        res.status(500).json({
+            message: "Failed to edit message",
+            error: error?.message || String(error),
+        });
+    }
+});
+
+app.post("/deleteMessage", async (req, res) => {
+    const targetId = sanitizeClientId(req.body.clientId || clientId);
+    const { groupId, key, messageId } = req.body;
+
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
+
+    if (!groupId || (!key && !messageId)) {
+        return res.status(400).json({ message: "groupId and key (or messageId) are required" });
+    }
+
+    try {
+        const jid = formatJid(groupId);
+        let messageKey: any = key;
+        if (typeof key === "string") {
+            try {
+                messageKey = JSON.parse(key);
+            } catch (_) {
+                messageKey = { remoteJid: jid, id: key, fromMe: true };
+            }
+        }
+        if (!messageKey && messageId) {
+            messageKey = { remoteJid: jid, id: messageId, fromMe: true };
+        }
+
+        await enqueueSocketSend(targetId, async () => {
+            return await entry.sock!.sendMessage(jid, {
+                delete: messageKey,
+            });
+        });
+
+        res.json({
+            message: "Message deleted successfully",
+            messageId: messageKey?.id,
+        });
+    } catch (error: any) {
+        console.error(`[${targetId}] Error deleting message in ${groupId}:`, error);
+        res.status(500).json({
+            message: "Failed to delete message",
+            error: error?.message || String(error),
+        });
     }
 });
 

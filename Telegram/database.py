@@ -199,6 +199,34 @@ def create_table():
         """
     )
 
+    # Table for Real-Time Content Sync: Message ID mappings (Telegram -> WhatsApp)
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS forwarded_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel_id TEXT NOT NULL,
+            tg_message_id INTEGER NOT NULL,
+            group_id TEXT NOT NULL,
+            wa_message_id TEXT,
+            wa_key_json TEXT,
+            sender_id TEXT DEFAULT 'user',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_fwd_lookup
+        ON forwarded_messages(channel_id, tg_message_id)
+        """
+    )
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_fwd_created_at
+        ON forwarded_messages(created_at)
+        """
+    )
+
     connection.commit()
     connection.close()
 
@@ -1072,6 +1100,107 @@ def get_auto_heal_stats() -> dict:
         "total_mb_reclaimed": round(total_bytes / (1024 * 1024), 1),
         "last_heal_time": last_heal_time,
     }
+
+
+def record_forwarded_message(
+    channel_id: str,
+    tg_message_id: int,
+    group_id: str,
+    wa_message_id: str | None = None,
+    wa_key_json: str | dict | None = None,
+    sender_id: str = "user",
+    wa_key: str | dict | None = None,
+):
+    """Records a mapping between a Telegram channel message and a dispatched WhatsApp message."""
+    channel_id = clean_id(channel_id)
+    if not channel_id or not tg_message_id or not group_id:
+        return
+    import json
+    if wa_key is not None and wa_key_json is None:
+        wa_key_json = wa_key
+    if isinstance(wa_key_json, dict):
+        wa_key_json = json.dumps(wa_key_json)
+
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO forwarded_messages (channel_id, tg_message_id, group_id, wa_message_id, wa_key_json, sender_id)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (channel_id, int(tg_message_id), str(group_id), wa_message_id, wa_key_json, sender_id),
+    )
+    connection.commit()
+    connection.close()
+
+
+def get_forwarded_messages(channel_id: str, tg_message_id: int) -> list[dict]:
+    """Retrieves all WhatsApp message records mapped to a Telegram channel post."""
+    channel_id = clean_id(channel_id)
+    if not channel_id or not tg_message_id:
+        return []
+    import json
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT group_id, wa_message_id, wa_key_json, sender_id, created_at
+        FROM forwarded_messages
+        WHERE channel_id = ? AND tg_message_id = ?
+        ORDER BY id ASC
+        """,
+        (channel_id, int(tg_message_id)),
+    )
+    rows = cursor.fetchall()
+    connection.close()
+
+    results = []
+    for r in rows:
+        key_obj = None
+        if r[2]:
+            try:
+                key_obj = json.loads(r[2])
+            except Exception:
+                key_obj = r[2]
+        results.append({
+            "group_id": r[0],
+            "wa_message_id": r[1],
+            "wa_key": key_obj,
+            "wa_key_json": r[2],
+            "sender_id": r[3] or "user",
+            "created_at": r[4],
+        })
+    return results
+
+
+def delete_forwarded_message_records(channel_id: str, tg_message_id: int) -> int:
+    """Removes mappings for a deleted Telegram post."""
+    channel_id = clean_id(channel_id)
+    if not channel_id or not tg_message_id:
+        return 0
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "DELETE FROM forwarded_messages WHERE channel_id = ? AND tg_message_id = ?",
+        (channel_id, int(tg_message_id)),
+    )
+    deleted_cnt = cursor.rowcount
+    connection.commit()
+    connection.close()
+    return deleted_cnt
+
+
+def prune_old_forwarded_messages(max_age_days: int = 14) -> int:
+    """Prunes forwarded message mappings older than max_age_days to conserve disk space."""
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        f"DELETE FROM forwarded_messages WHERE created_at < datetime('now', '-{int(max_age_days)} days')"
+    )
+    deleted_count = cursor.rowcount
+    connection.commit()
+    connection.close()
+    return deleted_count
 
 
 create_table()

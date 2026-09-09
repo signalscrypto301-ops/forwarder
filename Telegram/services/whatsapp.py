@@ -72,7 +72,8 @@ async def post_whatsapp_json(endpoint: str, data: dict, timeout_sec: int = 30) -
     bot_mod = _get_bot_module()
     get_session_fn = getattr(bot_mod, "get_http_session", get_http_session) if bot_mod else get_http_session
     session = await get_session_fn()
-    url = f"{config.whatsapp_service}/{endpoint}"
+    clean_ep = endpoint.lstrip("/")
+    url = f"{config.whatsapp_service.rstrip('/')}/{clean_ep}"
     if session:
         async with session.post(url, json=data, timeout=timeout_sec) as res:
             try:

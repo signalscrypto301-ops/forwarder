@@ -55,6 +55,7 @@ from bot import build_analytics_keyboard, build_analytics_detail_keyboard, fetch
 
 class TestAnalyticsEngine(unittest.TestCase):
     def setUp(self):
+        self.orig_db_path = database.DB_PATH
         self.test_db = os.path.join(os.path.dirname(__file__), "test_analytics.db")
         if os.path.exists(self.test_db):
             try:
@@ -65,6 +66,7 @@ class TestAnalyticsEngine(unittest.TestCase):
         database.create_table()
 
     def tearDown(self):
+        database.DB_PATH = self.orig_db_path
         if os.path.exists(self.test_db):
             try:
                 os.remove(self.test_db)
