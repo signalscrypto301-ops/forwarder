@@ -974,10 +974,18 @@ async def audit_admins_command(message: Message):
         )
         await status_msg.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+    except asyncio.TimeoutError:
+        logger.error("Timeout during audit_admins_command: WhatsApp service took longer than expected.")
+        await status_msg.edit_text(
+            "⏳ <b>Admin Audit Timed Out:</b>\n"
+            "<i>The WhatsApp audit request timed out querying channels. Please try again.</i>",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as e:
         logger.error(f"Error during audit_admins_command: {e}", exc_info=True)
+        err_detail = str(e).strip() or type(e).__name__
         await status_msg.edit_text(
-            f"❌ <b>Error running admin audit:</b> <code>{e}</code>",
+            f"❌ <b>Error running admin audit:</b> <code>{err_detail}</code>",
             parse_mode=ParseMode.HTML,
         )
 
@@ -1013,10 +1021,18 @@ async def handle_audit_admins_callback(call: CallbackQuery):
         )
         await call.message.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
+    except asyncio.TimeoutError:
+        logger.error("Timeout during handle_audit_admins_callback")
+        await call.message.edit_text(
+            "⏳ <b>Admin Audit Timed Out:</b>\n"
+            "<i>The WhatsApp audit request timed out querying channels. Please try again.</i>",
+            parse_mode=ParseMode.HTML,
+        )
     except Exception as e:
         logger.error(f"Error handling cb:audit_admins: {e}", exc_info=True)
+        err_detail = str(e).strip() or type(e).__name__
         await call.message.edit_text(
-            f"❌ <b>Error running admin audit:</b> <code>{e}</code>",
+            f"❌ <b>Error running admin audit:</b> <code>{err_detail}</code>",
             parse_mode=ParseMode.HTML,
         )
 

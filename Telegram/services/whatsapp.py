@@ -379,5 +379,5 @@ async def audit_channel_admins(destinations: list[str] | None = None) -> tuple[i
             destinations = []
 
     payload = {"destinations": destinations or []}
-    return await post_fn("audit-admins", payload, timeout_sec=30)
+    return await post_fn("audit-admins", payload, timeout_sec=90)
 

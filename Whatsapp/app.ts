@@ -1397,6 +1397,129 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
         const activeAccounts = CONFIGURED_ACCOUNTS.filter((acc) => requestedAccounts.includes(acc.id));
         const readyAccounts = activeAccounts.filter((acc) => sessions[acc.id]?.isReady && sessions[acc.id]?.sock);
 
+        // Pre-index account permissions and memberships in parallel across all accounts
+        interface AccountPermissionIndex {
+            clientId: string;
+            index: number;
+            label: string;
+            phone: string | null;
+            pushName?: string;
+            isReady: boolean;
+            newsletters: Map<string, { role: string; isAdmin: boolean; name?: string }>;
+            groups: Map<string, { role: string; isAdmin: boolean; name?: string }>;
+        }
+
+        const accountIndices: AccountPermissionIndex[] = await Promise.all(
+            activeAccounts.map(async (acc): Promise<AccountPermissionIndex> => {
+                const entry = sessions[acc.id];
+                const phone = entry?.phoneNumber || lastKnownPhones[acc.id] || null;
+                const pushName = entry?.pushName;
+
+                if (!entry || !entry.isReady || !entry.sock) {
+                    return {
+                        clientId: acc.id,
+                        index: acc.index,
+                        label: acc.label,
+                        phone,
+                        pushName,
+                        isReady: false,
+                        newsletters: new Map(),
+                        groups: new Map(),
+                    };
+                }
+
+                const sock = entry.sock;
+                const newsletters = new Map<string, { role: string; isAdmin: boolean; name?: string }>();
+                const groups = new Map<string, { role: string; isAdmin: boolean; name?: string }>();
+
+                // 1. Pre-fetch newsletters via MEX xwa2_newsletter_subscribed (fast bulk query)
+                if (executeWMexQueryFn && typeof sock.query === "function" && typeof sock.generateMessageTag === "function") {
+                    try {
+                        const mexPromise = executeWMexQueryFn(
+                            {},
+                            "6388546374527196",
+                            "xwa2_newsletter_subscribed",
+                            sock.query,
+                            sock.generateMessageTag
+                        );
+                        const timeoutPromise = new Promise<any>((_, reject) =>
+                            setTimeout(() => reject(new Error("MEX query timeout")), 4500)
+                        );
+                        const res = await Promise.race([mexPromise, timeoutPromise]);
+                        if (Array.isArray(res)) {
+                            for (const nl of res) {
+                                const id = nl?.id || nl?.jid;
+                                if (id) {
+                                    const name = nl?.thread_metadata?.name?.text || nl?.name || nl?.thread_metadata?.name;
+                                    const count = parseInt(nl?.thread_metadata?.subscribers_count || nl?.subscribers || "0", 10);
+                                    const viewerRole =
+                                        nl?.viewer_metadata?.role ||
+                                        nl?.role ||
+                                        nl?.viewerRole ||
+                                        nl?.thread_metadata?.viewer_metadata?.role;
+                                    let role = "SUBSCRIBER";
+                                    let isAdmin = false;
+                                    if (viewerRole) {
+                                        const rUpper = String(viewerRole).toUpperCase();
+                                        role = rUpper;
+                                        isAdmin = rUpper === "ADMIN" || rUpper === "OWNER";
+                                    }
+                                    newsletters.set(id, { role, isAdmin, name: name ? String(name) : undefined });
+                                    if (name) {
+                                        registerKnownNewsletter(id, String(name), count || undefined);
+                                    }
+                                }
+                            }
+                        }
+                    } catch (mexErr: any) {
+                        console.warn(`[${acc.id}] Audit MEX pre-indexing notice:`, mexErr?.message || mexErr);
+                    }
+                }
+
+                // 2. Pre-fetch groups participating in bulk (1 call per account)
+                try {
+                    const grpPromise = sock.groupFetchAllParticipating();
+                    const timeoutPromise = new Promise<any>((_, reject) =>
+                        setTimeout(() => reject(new Error("groupFetch timeout")), 4500)
+                    );
+                    const grps = await Promise.race([grpPromise, timeoutPromise]);
+                    if (grps && typeof grps === "object") {
+                        const cleanPhone = phone?.replace(/\D/g, "") || "";
+                        const myJidNum = sock.user?.id?.split(/[:@]/)[0] || "";
+
+                        for (const [gid, meta] of Object.entries<any>(grps)) {
+                            let role = "MEMBER";
+                            let isAdmin = false;
+                            const participant = meta?.participants?.find((p: any) => {
+                                const pNum = p.id?.split(/[:@]/)[0];
+                                return (cleanPhone && pNum === cleanPhone) || (myJidNum && pNum === myJidNum);
+                            });
+                            if (participant) {
+                                if (participant.admin === "admin" || participant.admin === "superadmin") {
+                                    isAdmin = true;
+                                    role = participant.admin === "superadmin" ? "OWNER" : "ADMIN";
+                                }
+                            }
+                            groups.set(gid, { role, isAdmin, name: meta?.subject });
+                        }
+                    }
+                } catch (grpErr: any) {
+                    console.warn(`[${acc.id}] Audit groupFetch pre-indexing notice:`, grpErr?.message || grpErr);
+                }
+
+                return {
+                    clientId: acc.id,
+                    index: acc.index,
+                    label: acc.label,
+                    phone,
+                    pushName,
+                    isReady: true,
+                    newsletters,
+                    groups,
+                };
+            })
+        );
+
         const destinationResults: Array<{
             id: string;
             name: string;
@@ -1442,6 +1565,22 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
             const isGroup = jid.endsWith("@g.us");
             let destName = knownNewslettersMap.get(jid)?.name || jid;
 
+            // Resolve name from account caches if not in disk cache
+            if (destName === jid) {
+                for (const accIndex of accountIndices) {
+                    const nlObj = accIndex.newsletters.get(jid);
+                    if (nlObj?.name) {
+                        destName = nlObj.name;
+                        break;
+                    }
+                    const grpObj = accIndex.groups.get(jid);
+                    if (grpObj?.name) {
+                        destName = grpObj.name;
+                        break;
+                    }
+                }
+            }
+
             const accountChecks: Array<{
                 clientId: string;
                 index: number;
@@ -1454,18 +1593,14 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
                 error?: string;
             }> = [];
 
-            for (const acc of activeAccounts) {
-                const entry = sessions[acc.id];
-                const phone = entry?.phoneNumber || lastKnownPhones[acc.id] || null;
-                const pushName = entry?.pushName;
-
-                if (!entry || !entry.isReady || !entry.sock) {
+            for (const accIndex of accountIndices) {
+                if (!accIndex.isReady) {
                     accountChecks.push({
-                        clientId: acc.id,
-                        index: acc.index,
-                        label: acc.label,
-                        phone,
-                        pushName,
+                        clientId: accIndex.clientId,
+                        index: accIndex.index,
+                        label: accIndex.label,
+                        phone: accIndex.phone,
+                        pushName: accIndex.pushName,
                         isReady: false,
                         isAdmin: false,
                         role: "NOT_CONNECTED",
@@ -1474,124 +1609,63 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
                     continue;
                 }
 
-                const sock = entry.sock;
-
                 if (isNewsletter) {
-                    try {
-                        let role = "NOT_IN_CHANNEL";
-                        let isAdmin = false;
-
-                        if (typeof (sock as any).newsletterMetadata === "function") {
-                            const meta = await (sock as any).newsletterMetadata("jid", jid);
-                            if (meta) {
-                                const resolvedName = meta.name || (meta as any).thread_metadata?.name?.text;
-                                if (resolvedName) {
-                                    destName = resolvedName;
-                                    registerKnownNewsletter(jid, resolvedName, meta.subscribers);
-                                }
-
-                                const viewerRole =
-                                    meta.viewer_metadata?.role ||
-                                    (meta as any).role ||
-                                    (meta as any).viewerRole ||
-                                    (meta as any).thread_metadata?.viewer_metadata?.role;
-
-                                if (viewerRole) {
-                                    const rUpper = String(viewerRole).toUpperCase();
-                                    role = rUpper;
-                                    isAdmin = rUpper === "ADMIN" || rUpper === "OWNER";
-                                } else if (meta.owner) {
-                                    const cleanPhone = phone?.replace(/\D/g, "") || "";
-                                    const myJid = sock.user?.id?.split(/[:@]/)[0] || "";
-                                    if ((cleanPhone && meta.owner.includes(cleanPhone)) || (myJid && meta.owner.includes(myJid))) {
-                                        role = "OWNER";
-                                        isAdmin = true;
-                                    }
-                                }
-                            }
-                        }
-
+                    const found = accIndex.newsletters.get(jid);
+                    if (found) {
                         accountChecks.push({
-                            clientId: acc.id,
-                            index: acc.index,
-                            label: acc.label,
-                            phone,
-                            pushName,
+                            clientId: accIndex.clientId,
+                            index: accIndex.index,
+                            label: accIndex.label,
+                            phone: accIndex.phone,
+                            pushName: accIndex.pushName,
                             isReady: true,
-                            isAdmin,
-                            role,
+                            isAdmin: found.isAdmin,
+                            role: found.role,
                         });
-                    } catch (nlErr: any) {
+                    } else {
                         accountChecks.push({
-                            clientId: acc.id,
-                            index: acc.index,
-                            label: acc.label,
-                            phone,
-                            pushName,
+                            clientId: accIndex.clientId,
+                            index: accIndex.index,
+                            label: accIndex.label,
+                            phone: accIndex.phone,
+                            pushName: accIndex.pushName,
                             isReady: true,
                             isAdmin: false,
                             role: "NOT_IN_CHANNEL",
-                            error: nlErr?.message || String(nlErr),
                         });
                     }
                 } else if (isGroup) {
-                    try {
-                        const meta = await sock.groupMetadata(jid);
-                        if (meta && meta.subject) {
-                            destName = meta.subject;
-                        }
-
-                        let role = "NOT_IN_GROUP";
-                        let isAdmin = false;
-
-                        const cleanPhone = phone?.replace(/\D/g, "") || "";
-                        const myJidNum = sock.user?.id?.split(/[:@]/)[0] || "";
-
-                        const participant = meta?.participants?.find((p: any) => {
-                            const pNum = p.id.split(/[:@]/)[0];
-                            return (cleanPhone && pNum === cleanPhone) || (myJidNum && pNum === myJidNum);
-                        });
-
-                        if (participant) {
-                            if (participant.admin === "admin" || participant.admin === "superadmin") {
-                                isAdmin = true;
-                                role = participant.admin === "superadmin" ? "OWNER" : "ADMIN";
-                            } else {
-                                isAdmin = false;
-                                role = "MEMBER";
-                            }
-                        }
-
+                    const found = accIndex.groups.get(jid);
+                    if (found) {
                         accountChecks.push({
-                            clientId: acc.id,
-                            index: acc.index,
-                            label: acc.label,
-                            phone,
-                            pushName,
+                            clientId: accIndex.clientId,
+                            index: accIndex.index,
+                            label: accIndex.label,
+                            phone: accIndex.phone,
+                            pushName: accIndex.pushName,
                             isReady: true,
-                            isAdmin,
-                            role,
+                            isAdmin: found.isAdmin,
+                            role: found.role,
                         });
-                    } catch (grpErr: any) {
+                    } else {
                         accountChecks.push({
-                            clientId: acc.id,
-                            index: acc.index,
-                            label: acc.label,
-                            phone,
-                            pushName,
+                            clientId: accIndex.clientId,
+                            index: accIndex.index,
+                            label: accIndex.label,
+                            phone: accIndex.phone,
+                            pushName: accIndex.pushName,
                             isReady: true,
                             isAdmin: false,
                             role: "NOT_IN_GROUP",
-                            error: grpErr?.message || String(grpErr),
                         });
                     }
                 } else {
                     accountChecks.push({
-                        clientId: acc.id,
-                        index: acc.index,
-                        label: acc.label,
-                        phone,
-                        pushName,
+                        clientId: accIndex.clientId,
+                        index: accIndex.index,
+                        label: accIndex.label,
+                        phone: accIndex.phone,
+                        pushName: accIndex.pushName,
                         isReady: true,
                         isAdmin: false,
                         role: "UNKNOWN_TYPE",
