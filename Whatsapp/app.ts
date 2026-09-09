@@ -15,6 +15,7 @@ import fs from "fs";
 import multer from "multer";
 import path from "path";
 import mime from "mime-types";
+import sharp from "sharp";
 
 const app = express();
 const clientId: string = process.env.CLIENT_ID || "user";
@@ -924,17 +925,37 @@ app.post("/getGroups", async (req, res) => {
 });
 
 
-// Helper function to build Baileys media payload
-function buildMediaPayload(filePath: string, originalName: string | undefined, caption?: string): AnyMessageContent {
+// Helper function to build Baileys media payload with width/height/thumbnail
+async function buildMediaPayload(filePath: string, originalName: string | undefined, caption?: string): Promise<AnyMessageContent> {
     const buffer = fs.readFileSync(filePath);
     const mimeType = (mime.lookup(originalName || filePath) || "application/octet-stream") as string;
 
     if (mimeType.startsWith("image/")) {
+        let width: number | undefined;
+        let height: number | undefined;
+        let jpegThumbnail: Buffer | undefined;
+
+        try {
+            const meta = await sharp(buffer).metadata();
+            width = meta.width;
+            height = meta.height;
+            // Generate low-res thumbnail matching WhatsApp standard (32-64px thumbnail)
+            jpegThumbnail = await sharp(buffer)
+                .resize(64, 64, { fit: "inside" })
+                .jpeg({ quality: 50 })
+                .toBuffer();
+        } catch (err) {
+            console.warn("Notice: could not extract image dimensions/thumbnail via sharp:", err);
+        }
+
         return {
             image: buffer,
             caption: caption || undefined,
             mimetype: mimeType,
-        };
+            width,
+            height,
+            jpegThumbnail,
+        } as any;
     } else if (mimeType.startsWith("video/")) {
         throw new Error("Video forwarding is banned");
     } else if (mimeType.startsWith("audio/")) {
@@ -990,7 +1011,7 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
                 console.warn(`[${targetId}] 🚫 Video forwarding is banned. Rejected: ${file.originalname}`);
                 return res.status(403).json({ message: "Video forwarding is banned" });
             }
-            const payload = buildMediaPayload(file.path, file.originalname, caption);
+            const payload = await buildMediaPayload(file.path, file.originalname, caption);
             await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
         } else if (caption) {
 
@@ -1074,7 +1095,7 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
 
         const jid = formatJid(groupId);
 
-        const payload = buildMediaPayload(file.path, file.originalname, caption);
+        const payload = await buildMediaPayload(file.path, file.originalname, caption);
         await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
 
         if (jid.endsWith("@newsletter")) {
