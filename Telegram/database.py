@@ -335,6 +335,20 @@ def get_groups_for_channel(channel_id):
     return [group[0] for group in groups]
 
 
+def get_all_unique_destinations() -> list[str]:
+    """
+    Returns all unique WhatsApp group and newsletter JIDs currently mapped for forwarding.
+    """
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        "SELECT DISTINCT group_id FROM channel_groups WHERE group_id IS NOT NULL AND TRIM(group_id) != '' ORDER BY group_id ASC"
+    )
+    rows = cursor.fetchall()
+    connection.close()
+    return [r[0] for r in rows if r[0]]
+
+
 def delete_group_for_channel(channel_id, group_id):
     channel_id = clean_id(channel_id)
     group_id = str(group_id).strip()

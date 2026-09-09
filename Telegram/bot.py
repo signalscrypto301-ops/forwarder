@@ -102,6 +102,7 @@ from services.whatsapp import (
     resolve_group_name,
     _sync_account_pool_now,
     sync_database_newsletters_to_whatsapp,
+    audit_channel_admins,
     AUDIENCE_CACHE,
     AUDIENCE_CACHE_LOCK,
     WHATSAPP_CHATS_CACHE,
@@ -131,6 +132,7 @@ from tasks.watchdog import (
     _get_all_sessions_status,
     _watchdog_attempt_reconnect,
     scheduled_session_watchdog_loop,
+    check_and_alert_admin_permissions,
     send_instant_logout_alert,
     scheduled_instant_disconnect_watchdog_loop,
     cmd_watchdog,
@@ -166,6 +168,9 @@ from handlers.admin import (
     health_stats_command,
     daily_report_command,
     stale_channels_command,
+    audit_admins_command,
+    format_admin_audit_report,
+    handle_audit_admins_callback,
     build_analytics_keyboard,
     build_analytics_detail_keyboard,
     analytics_command,
@@ -234,6 +239,8 @@ async def handle_callback_query(call: CallbackQuery):
         return await handle_healer_callbacks(call)
     if data.startswith("cb:ana:"):
         return await handle_analytics_callbacks(call)
+    if data == "cb:audit_admins":
+        return await handle_audit_admins_callback(call)
     if data.startswith("cb:acc:"):
         return await account_pool_callback_handler(call)
     if data in ("cb:dlq_refresh", "cb:dlq_purge", "cb:dlq_retry"):

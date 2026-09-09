@@ -1359,6 +1359,299 @@ app.post("/getGroups", async (req, res) => {
     }
 });
 
+app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
+    try {
+        let requestedDestinations: string[] = Array.isArray(req.body.destinations)
+            ? req.body.destinations.map((d: any) => String(d).trim()).filter(Boolean)
+            : [];
+
+        // If no destinations passed, collect from known newsletters and participating groups across ready accounts
+        if (requestedDestinations.length === 0) {
+            const destSet = new Set<string>();
+            for (const k of knownNewslettersMap.keys()) {
+                destSet.add(k);
+            }
+            for (const entry of Object.values(sessions)) {
+                if (entry.isReady && entry.sock) {
+                    try {
+                        const grps = await entry.sock.groupFetchAllParticipating();
+                        for (const gid of Object.keys(grps)) {
+                            destSet.add(gid);
+                        }
+                    } catch (_) {}
+                }
+            }
+            requestedDestinations = Array.from(destSet);
+        }
+
+        const uniqueDestinations = Array.from(new Set(requestedDestinations));
+
+        const requestedAccounts = Array.isArray(req.body.accountIds) && req.body.accountIds.length > 0
+            ? req.body.accountIds.map((a: any) => sanitizeClientId(String(a)))
+            : CONFIGURED_ACCOUNTS.map((a) => a.id);
+
+        const activeAccounts = CONFIGURED_ACCOUNTS.filter((acc) => requestedAccounts.includes(acc.id));
+        const readyAccounts = activeAccounts.filter((acc) => sessions[acc.id]?.isReady && sessions[acc.id]?.sock);
+
+        const destinationResults: Array<{
+            id: string;
+            name: string;
+            type: "newsletter" | "group" | "unknown";
+            allAdmins: boolean;
+            accounts: Array<{
+                clientId: string;
+                index: number;
+                label: string;
+                phone: string | null;
+                pushName?: string;
+                isReady: boolean;
+                isAdmin: boolean;
+                role: string;
+                error?: string;
+            }>;
+            missingAdmins: Array<{
+                clientId: string;
+                index: number;
+                label: string;
+                phone: string | null;
+                role: string;
+                error?: string;
+            }>;
+        }> = [];
+
+        const allIssues: Array<{
+            destinationId: string;
+            destinationName: string;
+            destinationType: string;
+            account: {
+                clientId: string;
+                index: number;
+                label: string;
+                phone: string | null;
+                role: string;
+                error?: string;
+            };
+        }> = [];
+
+        for (const jid of uniqueDestinations) {
+            const isNewsletter = jid.endsWith("@newsletter");
+            const isGroup = jid.endsWith("@g.us");
+            let destName = knownNewslettersMap.get(jid)?.name || jid;
+
+            const accountChecks: Array<{
+                clientId: string;
+                index: number;
+                label: string;
+                phone: string | null;
+                pushName?: string;
+                isReady: boolean;
+                isAdmin: boolean;
+                role: string;
+                error?: string;
+            }> = [];
+
+            for (const acc of activeAccounts) {
+                const entry = sessions[acc.id];
+                const phone = entry?.phoneNumber || lastKnownPhones[acc.id] || null;
+                const pushName = entry?.pushName;
+
+                if (!entry || !entry.isReady || !entry.sock) {
+                    accountChecks.push({
+                        clientId: acc.id,
+                        index: acc.index,
+                        label: acc.label,
+                        phone,
+                        pushName,
+                        isReady: false,
+                        isAdmin: false,
+                        role: "NOT_CONNECTED",
+                        error: "Account session is not logged in or reconnecting",
+                    });
+                    continue;
+                }
+
+                const sock = entry.sock;
+
+                if (isNewsletter) {
+                    try {
+                        let role = "NOT_IN_CHANNEL";
+                        let isAdmin = false;
+
+                        if (typeof (sock as any).newsletterMetadata === "function") {
+                            const meta = await (sock as any).newsletterMetadata("jid", jid);
+                            if (meta) {
+                                const resolvedName = meta.name || (meta as any).thread_metadata?.name?.text;
+                                if (resolvedName) {
+                                    destName = resolvedName;
+                                    registerKnownNewsletter(jid, resolvedName, meta.subscribers);
+                                }
+
+                                const viewerRole =
+                                    meta.viewer_metadata?.role ||
+                                    (meta as any).role ||
+                                    (meta as any).viewerRole ||
+                                    (meta as any).thread_metadata?.viewer_metadata?.role;
+
+                                if (viewerRole) {
+                                    const rUpper = String(viewerRole).toUpperCase();
+                                    role = rUpper;
+                                    isAdmin = rUpper === "ADMIN" || rUpper === "OWNER";
+                                } else if (meta.owner) {
+                                    const cleanPhone = phone?.replace(/\D/g, "") || "";
+                                    const myJid = sock.user?.id?.split(/[:@]/)[0] || "";
+                                    if ((cleanPhone && meta.owner.includes(cleanPhone)) || (myJid && meta.owner.includes(myJid))) {
+                                        role = "OWNER";
+                                        isAdmin = true;
+                                    }
+                                }
+                            }
+                        }
+
+                        accountChecks.push({
+                            clientId: acc.id,
+                            index: acc.index,
+                            label: acc.label,
+                            phone,
+                            pushName,
+                            isReady: true,
+                            isAdmin,
+                            role,
+                        });
+                    } catch (nlErr: any) {
+                        accountChecks.push({
+                            clientId: acc.id,
+                            index: acc.index,
+                            label: acc.label,
+                            phone,
+                            pushName,
+                            isReady: true,
+                            isAdmin: false,
+                            role: "NOT_IN_CHANNEL",
+                            error: nlErr?.message || String(nlErr),
+                        });
+                    }
+                } else if (isGroup) {
+                    try {
+                        const meta = await sock.groupMetadata(jid);
+                        if (meta && meta.subject) {
+                            destName = meta.subject;
+                        }
+
+                        let role = "NOT_IN_GROUP";
+                        let isAdmin = false;
+
+                        const cleanPhone = phone?.replace(/\D/g, "") || "";
+                        const myJidNum = sock.user?.id?.split(/[:@]/)[0] || "";
+
+                        const participant = meta?.participants?.find((p: any) => {
+                            const pNum = p.id.split(/[:@]/)[0];
+                            return (cleanPhone && pNum === cleanPhone) || (myJidNum && pNum === myJidNum);
+                        });
+
+                        if (participant) {
+                            if (participant.admin === "admin" || participant.admin === "superadmin") {
+                                isAdmin = true;
+                                role = participant.admin === "superadmin" ? "OWNER" : "ADMIN";
+                            } else {
+                                isAdmin = false;
+                                role = "MEMBER";
+                            }
+                        }
+
+                        accountChecks.push({
+                            clientId: acc.id,
+                            index: acc.index,
+                            label: acc.label,
+                            phone,
+                            pushName,
+                            isReady: true,
+                            isAdmin,
+                            role,
+                        });
+                    } catch (grpErr: any) {
+                        accountChecks.push({
+                            clientId: acc.id,
+                            index: acc.index,
+                            label: acc.label,
+                            phone,
+                            pushName,
+                            isReady: true,
+                            isAdmin: false,
+                            role: "NOT_IN_GROUP",
+                            error: grpErr?.message || String(grpErr),
+                        });
+                    }
+                } else {
+                    accountChecks.push({
+                        clientId: acc.id,
+                        index: acc.index,
+                        label: acc.label,
+                        phone,
+                        pushName,
+                        isReady: true,
+                        isAdmin: false,
+                        role: "UNKNOWN_TYPE",
+                        error: "Unknown destination format",
+                    });
+                }
+            }
+
+            const missingAdmins = accountChecks
+                .filter((ac) => !ac.isAdmin)
+                .map((ac) => ({
+                    clientId: ac.clientId,
+                    index: ac.index,
+                    label: ac.label,
+                    phone: ac.phone,
+                    role: ac.role,
+                    error: ac.error,
+                }));
+
+            const allAdmins = missingAdmins.length === 0;
+
+            for (const ma of missingAdmins) {
+                allIssues.push({
+                    destinationId: jid,
+                    destinationName: destName,
+                    destinationType: isNewsletter ? "newsletter" : isGroup ? "group" : "unknown",
+                    account: ma,
+                });
+            }
+
+            destinationResults.push({
+                id: jid,
+                name: destName,
+                type: isNewsletter ? "newsletter" : isGroup ? "group" : "unknown",
+                allAdmins,
+                accounts: accountChecks,
+                missingAdmins,
+            });
+        }
+
+        const allCompliant = allIssues.length === 0;
+
+        res.json({
+            allCompliant,
+            totalDestinations: uniqueDestinations.length,
+            totalConfiguredAccounts: activeAccounts.length,
+            totalReadyAccounts: readyAccounts.length,
+            issuesCount: allIssues.length,
+            issues: allIssues,
+            destinations: destinationResults,
+            timestamp: new Date().toISOString(),
+        });
+    } catch (error: any) {
+        console.error("Error auditing channel admins:", error);
+        res.status(500).json({
+            message: "Failed to audit channel admins",
+            error: error?.message || String(error),
+            allCompliant: false,
+            issues: [],
+            destinations: [],
+        });
+    }
+});
+
 
 // Helper function to build Baileys media payload with width/height/thumbnail
 async function buildMediaPayload(filePath: string, originalName: string | undefined, caption?: string): Promise<AnyMessageContent> {

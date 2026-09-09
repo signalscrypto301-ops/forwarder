@@ -376,7 +376,71 @@ async def scheduled_session_watchdog_loop():
         except Exception as e:
             logger.error(f"[Watchdog] Unexpected error in watchdog loop: {e}", exc_info=True)
 
+        try:
+            await check_and_alert_admin_permissions(bot_instance)
+        except Exception as e:
+            logger.debug(f"[Watchdog] check_and_alert_admin_permissions error: {e}")
+
         await asyncio.sleep(interval)
+
+
+_last_admin_permission_alert_time: float = 0.0
+
+
+async def check_and_alert_admin_permissions(bot_instance=None):
+    """
+    Periodically checks if all connected WhatsApp accounts are admins/owners in forwarded channels.
+    If issues are found, alerts admins (debounced every 6 hours).
+    """
+    global _last_admin_permission_alert_time
+    now = time.time()
+    if now - _last_admin_permission_alert_time < 21600:  # 6 hours debounce
+        return
+
+    bot_mod = _get_bot_module()
+    b_inst = bot_instance or (getattr(bot_mod, "bot", None) if bot_mod else None)
+    if not b_inst:
+        return
+
+    audit_fn = getattr(bot_mod, "audit_channel_admins", None)
+    if not audit_fn:
+        from services.whatsapp import audit_channel_admins as audit_fn
+
+    try:
+        status_code, data = await audit_fn()
+        if status_code == 200 and not data.get("allCompliant", False):
+            issues = data.get("issues", [])
+            ready_issues = [i for i in issues if i.get("account", {}).get("role") != "NOT_CONNECTED"]
+            if not ready_issues:
+                return
+
+            _last_admin_permission_alert_time = now
+
+            alert_lines = [
+                "⚠️ <b>[Watchdog Alert] Missing Channel Admin Permissions!</b>\n",
+                "One or more connected WhatsApp accounts do not have Admin/Owner rights in forwarded channels:\n",
+            ]
+            for idx, iss in enumerate(ready_issues[:8], 1):
+                d_name = iss.get("destinationName") or iss.get("destinationId")
+                acc = iss.get("account", {})
+                phone = acc.get("phone") or "No Phone"
+                lbl = acc.get("label") or f"Account {acc.get('index', '?')}"
+                r = acc.get("role", "NOT ADMIN")
+                alert_lines.append(f"• <b>{d_name}</b>: <code>{phone}</code> ({lbl}) is <b>{r}</b>")
+
+            if len(ready_issues) > 8:
+                alert_lines.append(f"<i>...and {len(ready_issues) - 8} more channels.</i>")
+
+            alert_lines.append("\n👉 <i>Promote these mobile numbers to Admin in WhatsApp or use /audit_admins to inspect!</i>")
+            msg_text = "\n".join(alert_lines)
+
+            for admin_id in config.admin_ids:
+                try:
+                    await b_inst.send_message(admin_id, msg_text, parse_mode=ParseMode.HTML)
+                except Exception as ex:
+                    logger.debug(f"[Watchdog] Failed to send permission alert to {admin_id}: {ex}")
+    except Exception as e:
+        logger.debug(f"[Watchdog] check_and_alert_admin_permissions notice: {e}")
 
 
 async def send_instant_logout_alert(

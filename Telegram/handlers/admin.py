@@ -47,6 +47,7 @@ from services.whatsapp import (
     post_whatsapp_json,
     _fetch_baileys_ram_mb,
     fetch_audience_metadata,
+    audit_channel_admins,
 )
 from tasks.scheduler import generate_daily_report_text, generate_stale_channels_digest
 
@@ -118,6 +119,7 @@ async def help_command(message: Message):
         "• 🩺 /watchdog — WhatsApp socket health monitor & auto-reconnect status\n"
         "• 🛡️ /health_stats <i>(alias: /rate_status)</i> — WhatsApp deliverability rate & safety metrics\n\n"
         "🔑 <b>WHATSAPP ACCOUNTS & SESSIONS:</b>\n"
+        "• 🛡️ /audit_admins <i>(alias: /check_admins, /verify_admins)</i> — Audit Admin/Owner rights across all connected WhatsApp accounts and forwarded channels\n"
         "• 📱 /accounts <i>(alias: /sessions, /pool)</i> — Multi-account pool dashboard & sender manager\n"
         "• 🔑 /login [1-4] — Generate WhatsApp QR code for Account 1, 2, 3, or 4\n"
         "• 🚪 /logout [1-4] — Disconnect and clean a specific WhatsApp session\n"
@@ -301,7 +303,18 @@ async def status_command(message: Message):
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "✅ <i>System operational, rate-throttled and secure.</i>"
     )
-    await message.reply(status_text, parse_mode=ParseMode.HTML)
+    IKM = _get_ikm()
+    IKB = _get_ikb()
+    kb = IKM(row_width=2)
+    kb.row(
+        IKB("🛡️ Audit Channel Admins", callback_data="cb:audit_admins"),
+        IKB("📱 Accounts Pool", callback_data="cb:acc:refresh"),
+    )
+    kb.row(
+        IKB("🩺 Auto-Healer", callback_data="cb:hlr:refresh"),
+        IKB("📈 Analytics", callback_data="cb:ana:main"),
+    )
+    await message.reply(status_text, parse_mode=ParseMode.HTML, reply_markup=kb)
 
 
 async def telemetry_command(message: Message):
@@ -744,10 +757,161 @@ async def handle_analytics_callbacks(callback_query: CallbackQuery):
             await callback_query.message.reply(text_report, reply_markup=kb_fn(), parse_mode=ParseMode.HTML)
 
 
+def format_admin_audit_report(data: dict) -> tuple[str, bool]:
+    """
+    Formats the WhatsApp admin audit report into human-readable HTML for Telegram.
+    Returns (formatted_text, all_compliant).
+    """
+    all_compliant = data.get("allCompliant", False)
+    total_destinations = data.get("totalDestinations", 0)
+    total_ready = data.get("totalReadyAccounts", 0)
+    total_configured = data.get("totalConfiguredAccounts", 4)
+    issues = data.get("issues", [])
+
+    if all_compliant:
+        text = (
+            "✅ <b>All Accounts Verified as Admins!</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"• <b>Active WhatsApp Accounts:</b> <code>{total_ready} / {total_configured}</code>\n"
+            f"• <b>Forwarding Destinations Audited:</b> <code>{total_destinations}</code>\n"
+            "• <b>Compliance Status:</b> <b>100% OK (All Admins/Owners)</b>\n\n"
+            "🎉 <i>All connected WhatsApp accounts have verified Admin or Owner permissions across all forwarded channels and groups. Forwarding is fully authorized with zero permission restrictions.</i>"
+        )
+        return text, True
+
+    header = (
+        "⚠️ <b>WhatsApp Admin Permission Issues Detected!</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "The following WhatsApp accounts are <b>NOT Admin or Owner</b> in the connected forwarding channels.\n"
+        "<i>Forwarding messages from these accounts will fail until promoted!</i>\n\n"
+    )
+
+    issue_lines = []
+    for idx, issue in enumerate(issues, 1):
+        dest_id = issue.get("destinationId", "Unknown")
+        dest_name = issue.get("destinationName") or dest_id
+        dest_type = issue.get("destinationType", "channel").upper()
+        acc = issue.get("account", {})
+        phone = acc.get("phone") or "No Phone (Not Logged In)"
+        label = acc.get("label") or f"Account {acc.get('index', '?')}"
+        role = acc.get("role", "NOT ADMIN").upper()
+        err_detail = f" <i>({acc.get('error')})</i>" if acc.get("error") and "session is not" not in acc.get("error", "").lower() else ""
+
+        type_emoji = "📢" if dest_type == "NEWSLETTER" else "👥"
+        card = (
+            f"❌ <b>#{idx} {type_emoji} {dest_name}</b>\n"
+            f"   └ 🆔 <b>ID:</b> <code>{dest_id}</code>\n"
+            f"   └ 📱 <b>Mobile:</b> <code>{phone}</code> ({label})\n"
+            f"   └ ⚠️ <b>Status:</b> <b>{role}</b>{err_detail}\n"
+        )
+        issue_lines.append(card)
+
+    footer = (
+        "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"📊 <b>Summary:</b> <code>{len(issues)} issue(s)</code> across <code>{total_destinations} destinations</code>.\n\n"
+        "👉 <b>Action Required:</b>\n"
+        "1. Open WhatsApp.\n"
+        "2. Open the respective Channel or Group settings.\n"
+        "3. Promote the listed <b>Mobile Number(s)</b> to <b>Admin</b> or <b>Channel Owner</b>.\n"
+    )
+
+    full_text = header + "\n".join(issue_lines) + footer
+    if len(full_text) > 4000:
+        truncated_lines = issue_lines[:15]
+        footer_trunc = f"\n<i>...and {len(issue_lines) - 15} more issues.</i>\n" + footer
+        full_text = header + "\n".join(truncated_lines) + footer_trunc
+
+    return full_text, False
+
+
+async def audit_admins_command(message: Message):
+    bot_mod = _get_bot_module()
+    admin_fn = getattr(bot_mod, "is_admin", is_admin) if bot_mod else is_admin
+    if not message.chat.type == "private" or not admin_fn(message.from_user.id):
+        return
+
+    status_msg = await message.reply(
+        "🔍 <b>Auditing WhatsApp Admin Permissions...</b>\n"
+        "<i>Inspecting all connected WhatsApp accounts against forwarded channels & groups...</i>",
+        parse_mode=ParseMode.HTML,
+    )
+
+    audit_fn = getattr(bot_mod, "audit_channel_admins", audit_channel_admins) if bot_mod else audit_channel_admins
+
+    try:
+        status_code, data = await audit_fn()
+        if status_code != 200:
+            err_msg = data.get("message") or data.get("error") or f"HTTP {status_code}"
+            await status_msg.edit_text(
+                f"❌ <b>Admin Audit Failed:</b> {err_msg}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        fmt_fn = getattr(bot_mod, "format_admin_audit_report", format_admin_audit_report) if bot_mod else format_admin_audit_report
+        report_text, _ = fmt_fn(data)
+
+        IKM = _get_ikm()
+        IKB = _get_ikb()
+        kb = IKM(row_width=2)
+        kb.row(
+            IKB("🔄 Re-Audit Now", callback_data="cb:audit_admins"),
+            IKB("📱 Accounts Pool", callback_data="cb:acc:refresh"),
+        )
+        await status_msg.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    except Exception as e:
+        logger.error(f"Error during audit_admins_command: {e}", exc_info=True)
+        await status_msg.edit_text(
+            f"❌ <b>Error running admin audit:</b> <code>{e}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
+async def handle_audit_admins_callback(call: CallbackQuery):
+    bot_mod = _get_bot_module()
+    admin_fn = getattr(bot_mod, "is_admin", is_admin) if bot_mod else is_admin
+    if not admin_fn(call.from_user.id):
+        await call.answer("Unauthorized", show_alert=True)
+        return
+
+    await call.answer("🔍 Auditing permissions...", show_alert=False)
+    audit_fn = getattr(bot_mod, "audit_channel_admins", audit_channel_admins) if bot_mod else audit_channel_admins
+
+    try:
+        status_code, data = await audit_fn()
+        if status_code != 200:
+            await call.message.edit_text(
+                f"❌ <b>Admin Audit Failed:</b> HTTP {status_code}",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+
+        fmt_fn = getattr(bot_mod, "format_admin_audit_report", format_admin_audit_report) if bot_mod else format_admin_audit_report
+        report_text, _ = fmt_fn(data)
+
+        IKM = _get_ikm()
+        IKB = _get_ikb()
+        kb = IKM(row_width=2)
+        kb.row(
+            IKB("🔄 Re-Audit Now", callback_data="cb:audit_admins"),
+            IKB("📱 Accounts Pool", callback_data="cb:acc:refresh"),
+        )
+        await call.message.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+
+    except Exception as e:
+        logger.error(f"Error handling cb:audit_admins: {e}", exc_info=True)
+        await call.message.edit_text(
+            f"❌ <b>Error running admin audit:</b> <code>{e}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+
+
 def register_admin_handlers(dp):
     dp.register_message_handler(start_command, commands=["start"])
     dp.register_message_handler(help_command, commands=["help"])
     dp.register_message_handler(status_command, commands=["status"])
+    dp.register_message_handler(audit_admins_command, commands=["audit_admins", "check_admins", "verify_admins", "admin_check"])
     dp.register_message_handler(telemetry_command, commands=["telemetry", "server_health", "resources"])
     dp.register_message_handler(healer_command, commands=["healer", "autoheal", "ram"])
     dp.register_message_handler(health_stats_command, commands=["health_stats", "rate_status"])
@@ -762,3 +926,8 @@ def register_admin_handlers(dp):
         handle_analytics_callbacks,
         lambda c: c.data and c.data.startswith("cb:ana:"),
     )
+    dp.register_callback_query_handler(
+        handle_audit_admins_callback,
+        lambda c: c.data and c.data == "cb:audit_admins",
+    )
+

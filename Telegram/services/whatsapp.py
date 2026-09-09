@@ -17,7 +17,7 @@ from aiogram.types import ParseMode
 
 import config
 from logger import logger
-from database import get_all_channels, get_groups_for_channel
+from database import get_all_channels, get_groups_for_channel, get_all_unique_destinations
 from account_pool import AccountPool
 
 http_session: aiohttp.ClientSession | None = None
@@ -359,3 +359,25 @@ async def sync_database_newsletters_to_whatsapp():
             await post_fn("registerNewsletters", {"newsletters": list(all_jids)}, timeout_sec=15)
     except Exception as e:
         logger.debug(f"sync_database_newsletters_to_whatsapp notice: {e}")
+
+
+async def audit_channel_admins(destinations: list[str] | None = None) -> tuple[int, dict]:
+    """
+    Queries the WhatsApp service to audit Admin & Owner permissions for all connected WhatsApp accounts.
+    If destinations is None, automatically pulls all active forwarding destinations from SQLite database.
+    Returns (status_code, response_data).
+    """
+    bot_mod = _get_bot_module()
+    post_fn = getattr(bot_mod, "post_whatsapp_json", post_whatsapp_json) if bot_mod else post_whatsapp_json
+    get_dests_fn = getattr(bot_mod, "get_all_unique_destinations", get_all_unique_destinations) if bot_mod else get_all_unique_destinations
+
+    if destinations is None:
+        try:
+            destinations = await asyncio.to_thread(get_dests_fn)
+        except Exception as e:
+            logger.warning(f"Error fetching destinations from database: {e}")
+            destinations = []
+
+    payload = {"destinations": destinations or []}
+    return await post_fn("audit-admins", payload, timeout_sec=30)
+
