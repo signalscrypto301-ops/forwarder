@@ -278,5 +278,87 @@ class TestAdminAudit(unittest.IsolatedAsyncioTestCase):
             self._set_audit_mock(bot.audit_channel_admins)
 
 
+    def test_format_admin_audit_report_angle_bracket_escaping(self):
+        """Angle brackets in destination names, IDs, or errors must be HTML escaped."""
+        raw_data = {
+            "allCompliant": False,
+            "totalDestinations": 1,
+            "totalReadyAccounts": 1,
+            "totalConfiguredAccounts": 4,
+            "issues": [
+                {
+                    "destinationId": "<120363319607678596@newsletter>",
+                    "destinationName": "<120363319607678596@newsletter>",
+                    "destinationType": "newsletter",
+                    "account": {
+                        "clientId": "user",
+                        "index": 1,
+                        "label": "<TestAccount>",
+                        "phone": "+12262406756",
+                        "role": "SUBSCRIBER",
+                        "error": "<some_error_code>",
+                    },
+                }
+            ],
+        }
+        text, compliant = admin.format_admin_audit_report(raw_data)
+        self.assertFalse(compliant)
+        # Should not contain unescaped start tags
+        self.assertNotIn("<120363319607678596@newsletter>", text)
+        self.assertNotIn("<TestAccount>", text)
+        self.assertNotIn("<some_error_code>", text)
+        # Raw destination IDs should be stripped of surrounding angle brackets
+        self.assertIn("120363319607678596@newsletter", text)
+        self.assertIn("&lt;TestAccount&gt;", text)
+        self.assertIn("&lt;some_error_code&gt;", text)
+
+    def test_database_id_sanitization(self):
+        """Database clean_id and clean_destination_id must strip angle brackets and quotes."""
+        self.assertEqual(database.clean_id("<-1004486923263>"), "-1004486923263")
+        self.assertEqual(database.clean_id("  '<12345>'  "), "12345")
+        self.assertEqual(database.clean_destination_id("<120363319607678596@newsletter>"), "120363319607678596@newsletter")
+        self.assertEqual(database.clean_destination_id('"123456@g.us"'), "123456@g.us")
+
+    async def test_watchdog_permission_alert_escapes_angle_brackets(self):
+        """Watchdog check_and_alert_admin_permissions must escape angle brackets to prevent Telegram parse crash."""
+        watchdog._last_admin_permission_alert_time = 0.0
+        mock_data = (
+            200,
+            {
+                "allCompliant": False,
+                "issues": [
+                    {
+                        "destinationId": "<120363319607678596@newsletter>",
+                        "destinationName": "<120363319607678596@newsletter>",
+                        "account": {
+                            "clientId": "user",
+                            "index": 1,
+                            "label": "<Account 1>",
+                            "phone": "+12262406756",
+                            "role": "NOT ADMIN",
+                        },
+                    }
+                ],
+            },
+        )
+        mock_bot = MagicMock()
+        mock_bot.send_message = AsyncMock()
+
+        mock_audit = AsyncMock(return_value=mock_data)
+        self._set_audit_mock(mock_audit)
+        try:
+            await watchdog.check_and_alert_admin_permissions(mock_bot)
+            mock_bot.send_message.assert_called_once()
+            args, kwargs = mock_bot.send_message.call_args
+            alert_text = args[1]
+            # Must not contain unescaped angle bracket tags like <120363319607678596@newsletter>
+            self.assertNotIn("<120363319607678596@newsletter>", alert_text)
+            self.assertNotIn("<Account 1>", alert_text)
+            self.assertIn("120363319607678596@newsletter", alert_text)
+            self.assertIn("&lt;Account 1&gt;", alert_text)
+        finally:
+            self._set_audit_mock(bot.audit_channel_admins)
+
+
 if __name__ == "__main__":
     unittest.main()

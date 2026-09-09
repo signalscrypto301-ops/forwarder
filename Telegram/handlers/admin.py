@@ -3,6 +3,8 @@ import sys
 import time
 import io
 import asyncio
+import html
+import re
 from datetime import datetime
 
 try:
@@ -902,14 +904,24 @@ def format_admin_audit_report(data: dict) -> tuple[str, bool]:
 
     issue_lines = []
     for idx, issue in enumerate(issues, 1):
-        dest_id = issue.get("destinationId", "Unknown")
-        dest_name = issue.get("destinationName") or dest_id
-        dest_type = issue.get("destinationType", "channel").upper()
+        raw_dest_id = str(issue.get("destinationId", "Unknown")).strip("<> ")
+        raw_dest_name = str(issue.get("destinationName") or raw_dest_id).strip("<> ")
+        dest_type = str(issue.get("destinationType", "channel")).upper()
         acc = issue.get("account", {})
-        phone = acc.get("phone") or "No Phone (Not Logged In)"
-        label = acc.get("label") or f"Account {acc.get('index', '?')}"
-        role = acc.get("role", "NOT ADMIN").upper()
-        err_detail = f" <i>({acc.get('error')})</i>" if acc.get("error") and "session is not" not in acc.get("error", "").lower() else ""
+        raw_phone = str(acc.get("phone") or "No Phone (Not Logged In)")
+        raw_label = str(acc.get("label") or f"Account {acc.get('index', '?')}")
+        raw_role = str(acc.get("role", "NOT ADMIN")).upper()
+
+        err_str = str(acc.get("error", "")).strip()
+        raw_err = f" ({err_str})" if err_str and "session is not" not in err_str.lower() else ""
+
+        # Escape ALL fields for Telegram HTML parse mode to prevent any entity parse crashes
+        dest_id = html.escape(raw_dest_id)
+        dest_name = html.escape(raw_dest_name)
+        phone = html.escape(raw_phone)
+        label = html.escape(raw_label)
+        role = html.escape(raw_role)
+        err_detail = f" <i>{html.escape(raw_err)}</i>" if raw_err else ""
 
         type_emoji = "📢" if dest_type == "NEWSLETTER" else "👥"
         card = (
@@ -957,7 +969,7 @@ async def audit_admins_command(message: Message):
         if status_code != 200:
             err_msg = data.get("message") or data.get("error") or f"HTTP {status_code}"
             await status_msg.edit_text(
-                f"❌ <b>Admin Audit Failed:</b> {err_msg}",
+                f"❌ <b>Admin Audit Failed:</b> {html.escape(str(err_msg))}",
                 parse_mode=ParseMode.HTML,
             )
             return
@@ -972,7 +984,12 @@ async def audit_admins_command(message: Message):
             IKB("🔄 Re-Audit Now", callback_data="cb:audit_admins"),
             IKB("📱 Accounts Pool", callback_data="cb:acc:refresh"),
         )
-        await status_msg.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        try:
+            await status_msg.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as html_err:
+            logger.warning(f"Failed to edit with HTML mode ({html_err}). Falling back to plain text...")
+            plain_report = re.sub(r"<[^>]+>", "", report_text)
+            await status_msg.edit_text(plain_report, reply_markup=kb)
 
     except asyncio.TimeoutError:
         logger.error("Timeout during audit_admins_command: WhatsApp service took longer than expected.")
@@ -983,7 +1000,7 @@ async def audit_admins_command(message: Message):
         )
     except Exception as e:
         logger.error(f"Error during audit_admins_command: {e}", exc_info=True)
-        err_detail = str(e).strip() or type(e).__name__
+        err_detail = html.escape(str(e).strip() or type(e).__name__)
         await status_msg.edit_text(
             f"❌ <b>Error running admin audit:</b> <code>{err_detail}</code>",
             parse_mode=ParseMode.HTML,
@@ -1019,7 +1036,12 @@ async def handle_audit_admins_callback(call: CallbackQuery):
             IKB("🔄 Re-Audit Now", callback_data="cb:audit_admins"),
             IKB("📱 Accounts Pool", callback_data="cb:acc:refresh"),
         )
-        await call.message.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        try:
+            await call.message.edit_text(report_text, parse_mode=ParseMode.HTML, reply_markup=kb)
+        except Exception as html_err:
+            logger.warning(f"Failed callback edit with HTML mode ({html_err}). Falling back to plain text...")
+            plain_report = re.sub(r"<[^>]+>", "", report_text)
+            await call.message.edit_text(plain_report, reply_markup=kb)
 
     except asyncio.TimeoutError:
         logger.error("Timeout during handle_audit_admins_callback")
@@ -1030,7 +1052,7 @@ async def handle_audit_admins_callback(call: CallbackQuery):
         )
     except Exception as e:
         logger.error(f"Error handling cb:audit_admins: {e}", exc_info=True)
-        err_detail = str(e).strip() or type(e).__name__
+        err_detail = html.escape(str(e).strip() or type(e).__name__)
         await call.message.edit_text(
             f"❌ <b>Error running admin audit:</b> <code>{err_detail}</code>",
             parse_mode=ParseMode.HTML,

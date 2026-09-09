@@ -8,6 +8,8 @@ def clean_id(channel_id):
     if not channel_id:
         return ""
     cid = str(channel_id).strip()
+    # Strip any leading/trailing angle brackets, quotes, or whitespace
+    cid = cid.strip("<>\"' \t\r\n")
     if cid.lower().startswith("id:"):
         cid = cid[3:].strip()
     # Normalize numeric Telegram channel IDs:
@@ -15,6 +17,15 @@ def clean_id(channel_id):
     if cid.isdigit() and len(cid) >= 9:
         cid = f"-100{cid}"
     return cid
+
+
+def clean_destination_id(dest_id):
+    if not dest_id:
+        return ""
+    did = str(dest_id).strip()
+    # Strip any leading/trailing angle brackets, quotes, or whitespace
+    did = did.strip("<>\"' \t\r\n")
+    return did
 
 
 def get_connection():
@@ -67,6 +78,10 @@ def create_table():
         WHERE channel_id IS NOT NULL AND channel_id != ''
         """
     )
+
+    # Auto-clean legacy malformed angle bracket rows from channel_groups and channels
+    cursor.execute("DELETE FROM channel_groups WHERE channel_id LIKE '%<%' OR group_id LIKE '%<%'")
+    cursor.execute("DELETE FROM channels WHERE channel_id LIKE '%<%'")
 
     # Add is_paused column to channels table if not already present (Optimization 4.A)
     try:
@@ -246,7 +261,7 @@ def add_channel(channel_id):
 
 def add_group_for_channel(channel_id, group_id):
     channel_id = clean_id(channel_id)
-    group_id = str(group_id).strip()
+    group_id = clean_destination_id(group_id)
     if not channel_id or not group_id:
         return
 
@@ -332,7 +347,7 @@ def get_groups_for_channel(channel_id):
     )
     groups = cursor.fetchall()
     connection.close()
-    return [group[0] for group in groups]
+    return [clean_destination_id(group[0]) for group in groups if clean_destination_id(group[0])]
 
 
 def get_all_unique_destinations() -> list[str]:
@@ -346,12 +361,12 @@ def get_all_unique_destinations() -> list[str]:
     )
     rows = cursor.fetchall()
     connection.close()
-    return [r[0] for r in rows if r[0]]
+    return [clean_destination_id(r[0]) for r in rows if r[0] and clean_destination_id(r[0])]
 
 
 def delete_group_for_channel(channel_id, group_id):
     channel_id = clean_id(channel_id)
-    group_id = str(group_id).strip()
+    group_id = clean_destination_id(group_id)
     connection = get_connection()
     cursor = connection.cursor()
     cursor.execute(

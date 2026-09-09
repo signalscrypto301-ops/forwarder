@@ -2,6 +2,8 @@ import sys
 import time
 import asyncio
 from collections import defaultdict
+import html
+import re
 import requests
 from aiogram.types import Message, ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -421,11 +423,12 @@ async def check_and_alert_admin_permissions(bot_instance=None):
                 "One or more connected WhatsApp accounts do not have Admin/Owner rights in forwarded channels:\n",
             ]
             for idx, iss in enumerate(ready_issues[:8], 1):
-                d_name = iss.get("destinationName") or iss.get("destinationId")
+                raw_dest_name = str(iss.get("destinationName") or iss.get("destinationId") or "").strip("<> ")
+                d_name = html.escape(raw_dest_name)
                 acc = iss.get("account", {})
-                phone = acc.get("phone") or "No Phone"
-                lbl = acc.get("label") or f"Account {acc.get('index', '?')}"
-                r = acc.get("role", "NOT ADMIN")
+                phone = html.escape(str(acc.get("phone") or "No Phone"))
+                lbl = html.escape(str(acc.get("label") or f"Account {acc.get('index', '?')}"))
+                r = html.escape(str(acc.get("role", "NOT ADMIN")))
                 alert_lines.append(f"• <b>{d_name}</b>: <code>{phone}</code> ({lbl}) is <b>{r}</b>")
 
             if len(ready_issues) > 8:
@@ -438,7 +441,12 @@ async def check_and_alert_admin_permissions(bot_instance=None):
                 try:
                     await b_inst.send_message(admin_id, msg_text, parse_mode=ParseMode.HTML)
                 except Exception as ex:
-                    logger.debug(f"[Watchdog] Failed to send permission alert to {admin_id}: {ex}")
+                    logger.debug(f"[Watchdog] Failed to send HTML permission alert to {admin_id}: {ex}. Falling back to plain text...")
+                    try:
+                        clean_plain = re.sub(r"<[^>]+>", "", msg_text)
+                        await b_inst.send_message(admin_id, clean_plain)
+                    except Exception as plain_ex:
+                        logger.debug(f"[Watchdog] Plain text fallback also failed for {admin_id}: {plain_ex}")
     except Exception as e:
         logger.debug(f"[Watchdog] check_and_alert_admin_permissions notice: {e}")
 
