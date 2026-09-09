@@ -270,6 +270,139 @@ class TestDeadLetterQueue(unittest.TestCase):
         # Media file should have been removed after successful photo dispatch
         self.assertFalse(os.path.exists(temp_media))
 
+    def test_increment_failed_message_retry_and_archival(self):
+        """Verify retry_count increments and moves to archived_failures when reaching 3."""
+        msg_id = database.add_failed_message(
+            channel_id="-100999",
+            group_id="12036399@g.us",
+            group_name="Forex VIP",
+            content_type="text",
+            caption="Persistent failure signal",
+            reason="Initial error",
+        )
+
+        self.assertEqual(database.get_archived_failures_count(), 0)
+
+        # 1st retry increment
+        c1 = database.increment_failed_message_retry(msg_id, "Attempt 1 failed")
+        self.assertEqual(c1, 1)
+        items = database.get_failed_messages()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["retry_count"], 1)
+        self.assertEqual(items[0]["reason"], "Attempt 1 failed")
+
+        # 2nd retry increment
+        c2 = database.increment_failed_message_retry(msg_id, "Attempt 2 failed")
+        self.assertEqual(c2, 2)
+        items = database.get_failed_messages()
+        self.assertEqual(items[0]["retry_count"], 2)
+
+        # 3rd retry increment -> Should be archived!
+        c3 = database.increment_failed_message_retry(msg_id, "Attempt 3 failed")
+        self.assertEqual(c3, 3)
+
+        # Should be removed from active failed_messages
+        self.assertEqual(database.get_failed_messages_count(), 0)
+        self.assertEqual(len(database.get_failed_messages()), 0)
+
+        # Should be present in archived_failures
+        self.assertEqual(database.get_archived_failures_count(), 1)
+
+    def test_dlq_head_of_line_blocking_prevented(self):
+        """Verify items with lower retry_count are prioritized over previously failed items."""
+        id_old = database.add_failed_message(
+            channel_id="-1001",
+            group_id="group1@g.us",
+            content_type="text",
+            caption="Old message that failed once",
+        )
+        database.increment_failed_message_retry(id_old, "Failed once")
+
+        id_new1 = database.add_failed_message(
+            channel_id="-1002",
+            group_id="group2@g.us",
+            content_type="text",
+            caption="Fresh message 1",
+        )
+        id_new2 = database.add_failed_message(
+            channel_id="-1003",
+            group_id="group3@g.us",
+            content_type="text",
+            caption="Fresh message 2",
+        )
+
+        # With limit=2, fresh messages (retry_count=0) should come BEFORE id_old (retry_count=1)
+        items = database.get_failed_messages(limit=2)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["id"], id_new1)
+        self.assertEqual(items[1]["id"], id_new2)
+
+        # With limit=3, id_old comes last
+        items_all = database.get_failed_messages(limit=3)
+        self.assertEqual(len(items_all), 3)
+        self.assertEqual(items_all[2]["id"], id_old)
+
+    def test_retry_all_failed_messages_increments_retry_count_on_failure(self):
+        """Verify retry_all_failed_messages calls increment_failed_message_retry on failure."""
+        id_fail = database.add_failed_message(
+            channel_id="-1001",
+            group_id="fail_group@g.us",
+            content_type="text",
+            caption="Will fail",
+        )
+
+        async def mock_send(*args, **kwargs):
+            return False
+
+        with patch.object(bot, "send_to_single_group", side_effect=mock_send):
+            recovered, failed = asyncio.run(bot.retry_all_failed_messages())
+
+        self.assertEqual(recovered, 0)
+        self.assertEqual(failed, 1)
+
+        items = database.get_failed_messages()
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["retry_count"], 1)
+
+    def test_send_to_single_group_retries_on_503_and_session_unauthorized(self):
+        """Verify send_to_single_group retries when service returns 503 or 400 session error."""
+        responses = [
+            # Attempt 0: 503 Service Unavailable (session reconnecting)
+            (503, {"message": "Session is not ready or reconnecting", "status": "reconnecting"}),
+            # Attempt 1: 200 OK
+            (200, {"message": "Text message sent successfully"}),
+        ]
+
+        attempt_counter = [0]
+
+        def mock_post(url, json=None, data=None, timeout=None):
+            resp = MagicMock()
+            status, body = responses[attempt_counter[0]]
+            attempt_counter[0] += 1
+            resp.status = status
+            resp.json = AsyncMock(return_value=body)
+            resp.text = AsyncMock(return_value=str(body))
+            resp.__aenter__ = AsyncMock(return_value=resp)
+            resp.__aexit__ = AsyncMock(return_value=None)
+            return resp
+
+        mock_session = MagicMock()
+        mock_session.post = mock_post
+
+        with patch.object(bot, "get_http_session", AsyncMock(return_value=mock_session)), \
+             patch("asyncio.sleep", AsyncMock()):
+            success = asyncio.run(
+                bot.send_to_single_group(
+                    group="test_grp@g.us",
+                    downloaded_media=None,
+                    caption="Test signal",
+                    content_type="text",
+                )
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(attempt_counter[0], 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import makeWASocket, {
     makeCacheableSignalKeyStore,
     WASocket,
     AnyMessageContent,
+    Browsers,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
 import pino from "pino";
@@ -305,7 +306,7 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
         },
         logger,
         printQRInTerminal: false,
-        browser: ["Forwarder WhatsApp", "Chrome", "1.0.0"],
+        browser: Browsers.ubuntu("Chrome"),
         generateHighQualityLinkPreview: false,
     });
 
@@ -582,13 +583,32 @@ app.post("/createsession", async (req, res) => {
     entry.authFailureListeners.push(onAuthFail);
 });
 
+function checkSessionReadiness(targetId: string, res: express.Response): SessionEntry | null {
+    const entry = sessions[targetId];
+    if (entry && entry.isReady && entry.sock) {
+        return entry;
+    }
+    const hasAuthFolder = fs.existsSync(path.resolve(".baileys_auth", `session-${targetId}`));
+    if (entry?.isRestarting || (entry && !entry.isReady && entry.sock) || hasAuthFolder) {
+        res.status(503).json({
+            message: "Session is not ready or reconnecting",
+            status: "reconnecting",
+            clientId: targetId,
+        });
+        return null;
+    }
+    res.status(401).json({
+        message: "Session is not authorized",
+        status: "not_logged_in",
+        clientId: targetId,
+    });
+    return null;
+}
+
 app.post("/startlistening", async (req, res) => {
     const targetId = sanitizeClientId(req.body.clientId || clientId);
-    const entry = sessions[targetId];
-
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({ message: "Session is not authorized" });
-    }
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
 
     if (entry.isListening) {
         return res.json({ message: "Already listening to messages." });
@@ -750,10 +770,8 @@ app.post("/getChatId", async (req, res) => {
         return res.status(400).json({ message: "chatName is required" });
     }
 
-    const entry = sessions[targetId];
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({ message: "Session is not authorized" });
-    }
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
 
     try {
         const sock = entry.sock;
@@ -920,10 +938,8 @@ app.post("/getChatId", async (req, res) => {
 
 app.get("/groups", async (req, res) => {
     const targetId = sanitizeClientId((req.query.clientId as string) || clientId);
-    const entry = sessions[targetId];
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({ message: "Session is not authorized", chats: [], total: 0 });
-    }
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
 
     try {
         const chats = await discoverChats(entry, targetId);
@@ -949,18 +965,8 @@ app.get("/groups", async (req, res) => {
 
 app.get("/audience-stats", async (req, res) => {
     const targetId = sanitizeClientId((req.query.clientId as string) || clientId);
-    const entry = sessions[targetId];
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({
-            message: "Session is not authorized",
-            totalAudience: 0,
-            groupsCount: 0,
-            groupMembers: 0,
-            newslettersCount: 0,
-            newsletterSubscribers: 0,
-            destinations: [],
-        });
-    }
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
 
     try {
         const chats = await discoverChats(entry, targetId);
@@ -1013,10 +1019,8 @@ app.get("/audience-stats", async (req, res) => {
 
 app.post("/getGroups", async (req, res) => {
     const targetId = sanitizeClientId(req.body.clientId || (req.query.clientId as string) || clientId);
-    const entry = sessions[targetId];
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({ message: "Session is not authorized", chats: [], total: 0 });
-    }
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
 
     try {
         const chats = await discoverChats(entry, targetId);
@@ -1114,10 +1118,8 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
     const file = req.file;
 
     try {
-        const entry = sessions[targetId];
-        if (!(entry && entry.isReady && entry.sock)) {
-            return res.status(400).json({ message: "Session is not authorized" });
-        }
+        const entry = checkSessionReadiness(targetId, res);
+        if (!entry) return;
 
         const jid = formatJid(groupId);
         if (file) {
@@ -1162,10 +1164,8 @@ app.post("/sendText", async (req, res) => {
     const targetId = sanitizeClientId(req.body.clientId || clientId);
     const { groupId, text } = req.body;
 
-    const entry = sessions[targetId];
-    if (!(entry && entry.isReady && entry.sock)) {
-        return res.status(400).json({ message: "Session is not authorized" });
-    }
+    const entry = checkSessionReadiness(targetId, res);
+    if (!entry) return;
 
     if (!groupId || !text) {
         return res.status(400).json({ message: "groupId and text are required" });
@@ -1193,10 +1193,8 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
     const file = req.file;
 
     try {
-        const entry = sessions[targetId];
-        if (!(entry && entry.isReady && entry.sock)) {
-            return res.status(400).json({ message: "Session is not authorized" });
-        }
+        const entry = checkSessionReadiness(targetId, res);
+        if (!entry) return;
 
         if (!file) {
             return res.status(400).json({ message: "No media file provided" });

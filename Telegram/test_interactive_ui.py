@@ -1,5 +1,9 @@
+import os
 import sys
+import unittest
 from unittest.mock import MagicMock
+
+sys.path.insert(0, os.path.dirname(__file__))
 
 # Mock third-party libraries if not installed in host Python environment
 for mod in ["yaml", "aiogram", "aiogram.utils", "aiogram.utils.executor", "aiogram.types", "telethon", "telethon.sessions", "qrcode"]:
@@ -39,6 +43,7 @@ from database import (
     add_channel,
     delete_channel,
     add_group_for_channel,
+    get_channels_overview,
     is_channel_paused,
     set_channel_paused,
     get_channel_details,
@@ -115,7 +120,62 @@ def test_inline_keyboards():
     print("[OK] Interactive inline keyboard builders verified!")
 
 
+def test_channels_overview_consolidation():
+    print("Testing get_channels_overview consolidation & single query menu...")
+    ch1 = clean_id("7777000001")
+    ch2 = clean_id("7777000002")
+    ch3 = clean_id("7777000003")
+
+    for ch in [ch1, ch2, ch3]:
+        delete_channel(ch)
+        add_channel(ch)
+
+    add_group_for_channel(ch1, "grp1@g.us")
+    add_group_for_channel(ch1, "grp2@g.us")
+    add_group_for_channel(ch2, "grp3@g.us")
+    set_channel_paused(ch2, True)
+
+    overview = get_channels_overview()
+    overview_map = {item["channel_id"]: item for item in overview}
+
+    assert ch1 in overview_map, f"{ch1} missing from overview"
+    assert overview_map[ch1]["is_paused"] is False
+    assert overview_map[ch1]["group_count"] == 2
+
+    assert ch2 in overview_map, f"{ch2} missing from overview"
+    assert overview_map[ch2]["is_paused"] is True
+    assert overview_map[ch2]["group_count"] == 1
+
+    assert ch3 in overview_map, f"{ch3} missing from overview"
+    assert overview_map[ch3]["is_paused"] is False
+    assert overview_map[ch3]["group_count"] == 0
+
+    text, kb = build_channels_keyboard(page=1, per_page=1000)
+    btn_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert any(f"🟢 {ch1} (2 grps)" in t for t in btn_texts), f"Expected button for {ch1} with 2 grps"
+    assert any(f"⏸️ {ch2} (Paused)" in t for t in btn_texts), f"Expected button for {ch2} Paused"
+    assert any(f"🟢 {ch3} (0 grps)" in t for t in btn_texts), f"Expected button for {ch3} with 0 grps"
+
+    for ch in [ch1, ch2, ch3]:
+        delete_channel(ch)
+
+    print("[OK] get_channels_overview consolidation verified!")
+
+
+class TestInteractiveUI(unittest.TestCase):
+    def setUp(self):
+        import database
+        database.create_table()
+
+    def test_database_pause_resume(self):
+        test_database_pause_resume()
+
+    def test_inline_keyboards(self):
+        test_inline_keyboards()
+
+    def test_channels_overview_consolidation(self):
+        test_channels_overview_consolidation()
+
+
 if __name__ == "__main__":
-    test_database_pause_resume()
-    test_inline_keyboards()
-    print("\n[SUCCESS] ALL INTERACTIVE TELEGRAM UI TESTS PASSED!")
+    unittest.main()

@@ -4,6 +4,8 @@ import unittest
 import tempfile
 from unittest.mock import MagicMock
 
+sys.path.insert(0, os.path.dirname(__file__))
+
 # Mock dependencies not installed in host environment
 for mod in ["yaml", "aiogram", "aiogram.utils", "aiogram.utils.executor", "aiogram.types", "telethon", "telethon.sessions", "qrcode", "aiohttp", "requests"]:
     if mod not in sys.modules:
@@ -42,14 +44,14 @@ class TestEmergencyControls(unittest.TestCase):
     def setUp(self):
         self.temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
         self.temp_db.close()
+        self.orig_db_path = database.DB_PATH
         database.DB_PATH = self.temp_db.name
         bot.InlineKeyboardMarkup = MockInlineKeyboardMarkup
         bot.InlineKeyboardButton = MockInlineKeyboardButton
         database.create_table()
 
-
-
     def tearDown(self):
+        database.DB_PATH = self.orig_db_path
         if os.path.exists(self.temp_db.name):
             try:
                 os.remove(self.temp_db.name)

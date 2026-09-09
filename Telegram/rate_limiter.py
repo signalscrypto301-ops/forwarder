@@ -1,8 +1,8 @@
 import asyncio
 import time
 import random
-from collections import deque
-from typing import Tuple, Optional, Dict
+from collections import deque, defaultdict
+from typing import Tuple, Optional, Dict, List
 
 
 class TokenBucket:
@@ -45,11 +45,12 @@ class TokenBucket:
 class DeliveryRateController:
     """
     Centralized WhatsApp Anti-Ban & Deliverability Protection Controller:
-    - Enforces Token Bucket per recipient JID
+    - Enforces Token Bucket per (account_id, recipient_id)
     - Implements Queue-Depth Aware humanized pacing with Gaussian jitter
-    - Tracks message volume over 1-hour and 24-hour sliding windows
-    - Alerts administrators when approaching safety thresholds
-    - Automatically engages progressive cooldown under heavy load
+    - Tracks message volume over 1-hour and 24-hour sliding windows PER ACCOUNT
+    - Alerts administrators when an account approaches safety thresholds
+    - Automatically engages progressive cooldown under heavy load per account
+    - Scales aggregate delivery throughput with multi-account pools
     """
 
     def __init__(
@@ -59,6 +60,7 @@ class DeliveryRateController:
         alert_threshold_percent: float = 80.0,
         per_recipient_rate: float = 0.2,
         per_recipient_burst: int = 3,
+        account_ids: Optional[List[str]] = None,
     ):
         self.max_per_hour = max_per_hour
         self.max_per_day = max_per_day
@@ -66,14 +68,34 @@ class DeliveryRateController:
         self.per_recipient_rate = per_recipient_rate
         self.per_recipient_burst = per_recipient_burst
 
+        # Configured accounts list (defaults to ["user"])
+        self.account_ids: List[str] = list(account_ids) if account_ids else ["user"]
+
+        # Recipient buckets keyed by f"{account_id}:{recipient_id}" or recipient_id
         self.recipient_buckets: Dict[str, TokenBucket] = {}
-        self.sliding_hour: deque[float] = deque()
-        self.sliding_day: deque[float] = deque()
+
+        # Per-account sliding windows
+        self.account_sliding_hour: Dict[str, deque[float]] = defaultdict(deque)
+        self.account_sliding_day: Dict[str, deque[float]] = defaultdict(deque)
+
+        for acc in self.account_ids:
+            self.account_sliding_hour[acc] = deque()
+            self.account_sliding_day[acc] = deque()
 
         self.active_queue_depth: int = 0
-        self._last_warning_alert: float = 0.0
-        self._last_critical_alert: float = 0.0
+        self._last_warning_alert: Dict[str, float] = defaultdict(float)
+        self._last_critical_alert: Dict[str, float] = defaultdict(float)
         self._lock = asyncio.Lock()
+
+    @property
+    def sliding_hour(self) -> deque[float]:
+        """Backward compatibility for direct access to default account sliding hour."""
+        return self.account_sliding_hour["user"]
+
+    @property
+    def sliding_day(self) -> deque[float]:
+        """Backward compatibility for direct access to default account sliding day."""
+        return self.account_sliding_day["user"]
 
     def enter_queue(self):
         """Increments current active in-flight delivery count."""
@@ -83,35 +105,45 @@ class DeliveryRateController:
         """Decrements current active in-flight delivery count."""
         self.active_queue_depth = max(0, self.active_queue_depth - 1)
 
-    def get_bucket(self, recipient_id: str) -> TokenBucket:
-        """Retrieves or creates a TokenBucket for the specific recipient."""
-        if recipient_id not in self.recipient_buckets:
-            self.recipient_buckets[recipient_id] = TokenBucket(
+    def _bucket_key(self, recipient_id: str, account_id: Optional[str] = None) -> str:
+        return f"{account_id}:{recipient_id}" if account_id else recipient_id
+
+    def get_bucket(self, recipient_id: str, account_id: Optional[str] = None) -> TokenBucket:
+        """Retrieves or creates a TokenBucket for the specific recipient and account."""
+        key = self._bucket_key(recipient_id, account_id)
+        if key not in self.recipient_buckets:
+            self.recipient_buckets[key] = TokenBucket(
                 capacity=float(self.per_recipient_burst),
                 refill_rate=float(self.per_recipient_rate),
             )
-        return self.recipient_buckets[recipient_id]
+        return self.recipient_buckets[key]
 
-    def _prune_expired(self, now: float):
+    def _prune_expired(self, now: float, account_id: Optional[str] = None):
         """Prunes timestamps older than 1 hour and 24 hours."""
         hour_cutoff = now - 3600.0
-        while self.sliding_hour and self.sliding_hour[0] < hour_cutoff:
-            self.sliding_hour.popleft()
-
         day_cutoff = now - 86400.0
-        while self.sliding_day and self.sliding_day[0] < day_cutoff:
-            self.sliding_day.popleft()
 
-    def calculate_pacing_delay(self, recipient_id: str) -> float:
+        targets = [account_id] if account_id else list(self.account_sliding_hour.keys())
+        for acc in targets:
+            h_deque = self.account_sliding_hour.get(acc)
+            if h_deque:
+                while h_deque and h_deque[0] < hour_cutoff:
+                    h_deque.popleft()
+            d_deque = self.account_sliding_day.get(acc)
+            if d_deque:
+                while d_deque and d_deque[0] < day_cutoff:
+                    d_deque.popleft()
+
+    def calculate_pacing_delay(self, recipient_id: str, account_id: str = "user") -> float:
         """
         Calculates a humanized pacing delay:
         - Scales based on active queue depth
         - Differentiates between strict groups (@g.us) and newsletters (@newsletter)
         - Injects Gaussian jitter to eliminate uniform machine periodicity
-        - Applies progressive cooldown multipliers when limits are approached
+        - Applies progressive cooldown multipliers based on the specific account's volume
         """
         now = time.time()
-        self._prune_expired(now)
+        self._prune_expired(now, account_id=account_id)
 
         q = self.active_queue_depth
 
@@ -127,9 +159,11 @@ class DeliveryRateController:
         if "@g.us" in recipient_id:
             base_delay *= 1.25
 
-        # Check for volume-based progressive cooldown
-        hour_ratio = len(self.sliding_hour) / max(1, self.max_per_hour)
-        day_ratio = len(self.sliding_day) / max(1, self.max_per_day)
+        # Check for volume-based progressive cooldown for THIS specific account
+        h_deque = self.account_sliding_hour.get(account_id, deque())
+        d_deque = self.account_sliding_day.get(account_id, deque())
+        hour_ratio = len(h_deque) / max(1, self.max_per_hour)
+        day_ratio = len(d_deque) / max(1, self.max_per_day)
         max_ratio = max(hour_ratio, day_ratio)
 
         if max_ratio >= 1.0:
@@ -145,79 +179,156 @@ class DeliveryRateController:
         final_delay = max(0.6, base_delay * jitter)
         return round(final_delay, 3)
 
-    def record_sent(self):
-        """Records a successfully dispatched message timestamp."""
+    def record_sent(self, account_id: str = "user"):
+        """Records a successfully dispatched message timestamp for a specific account."""
         now = time.time()
-        self.sliding_hour.append(now)
-        self.sliding_day.append(now)
-        self._prune_expired(now)
+        self.account_sliding_hour[account_id].append(now)
+        self.account_sliding_day[account_id].append(now)
+        self._prune_expired(now, account_id=account_id)
 
-    def check_health(self) -> Tuple[str, Optional[str]]:
+    def check_health(self, account_id: Optional[str] = None) -> Tuple[str, Optional[str]]:
         """
-        Evaluates current sending volume against safety thresholds.
-        Returns (status, alert_message) where status is 'OK', 'WARNING', or 'CRITICAL'.
-        Alerts are debounced (WARNING: 30 mins, CRITICAL: 15 mins).
+        Evaluates sending volume against safety thresholds.
+        If account_id is provided, evaluates for that account.
+        If account_id is None, evaluates across all accounts and returns the highest severity alert.
+        Alerts are debounced (WARNING: 30 mins, CRITICAL: 15 mins) per account.
         """
         now = time.time()
-        self._prune_expired(now)
+        self._prune_expired(now, account_id=account_id)
 
-        hour_count = len(self.sliding_hour)
-        day_count = len(self.sliding_day)
+        targets = [account_id] if account_id else list(self.account_sliding_hour.keys())
+        if not targets:
+            targets = ["user"]
 
-        hour_pct = (hour_count / max(1, self.max_per_hour)) * 100.0
-        day_pct = (day_count / max(1, self.max_per_day)) * 100.0
-        max_pct = max(hour_pct, day_pct)
+        highest_status = "OK"
+        highest_msg = None
 
-        if max_pct >= 100.0:
-            # Critical threshold
-            if now - self._last_critical_alert > 900.0:  # 15 minutes debounce
-                self._last_critical_alert = now
-                msg = (
-                    "🚨 <b>WhatsApp Account Health CRITICAL</b>\n\n"
-                    f"Message volume has reached safety limits!\n"
-                    f"• <b>Last 1 Hour:</b> <code>{hour_count} / {self.max_per_hour}</code> ({hour_pct:.1f}%)\n"
-                    f"• <b>Last 24 Hours:</b> <code>{day_count} / {self.max_per_day}</code> ({day_pct:.1f}%)\n"
-                    f"• <b>Active Queue Depth:</b> <code>{self.active_queue_depth}</code>\n\n"
-                    "⚠️ <i>Emergency rate throttling engaged (2.5x delay) to protect account from automated WhatsApp spam bans.</i>"
-                )
-                return "CRITICAL", msg
-            return "CRITICAL", None
+        for acc in targets:
+            h_deque = self.account_sliding_hour.get(acc, deque())
+            d_deque = self.account_sliding_day.get(acc, deque())
+            hour_count = len(h_deque)
+            day_count = len(d_deque)
 
-        if max_pct >= self.alert_threshold_percent:
-            # Warning threshold
-            if now - self._last_warning_alert > 1800.0:  # 30 minutes debounce
-                self._last_warning_alert = now
-                msg = (
-                    "⚠️ <b>WhatsApp Account Health Warning</b>\n\n"
-                    f"Broadcast volume is approaching safety thresholds:\n"
-                    f"• <b>Last 1 Hour:</b> <code>{hour_count} / {self.max_per_hour}</code> ({hour_pct:.1f}%)\n"
-                    f"• <b>Last 24 Hours:</b> <code>{day_count} / {self.max_per_day}</code> ({day_pct:.1f}%)\n"
-                    f"• <b>Active Queue Depth:</b> <code>{self.active_queue_depth}</code>\n\n"
-                    "ℹ️ <i>Adaptive pacing automatically increased by 1.5x.</i>"
-                )
-                return "WARNING", msg
-            return "WARNING", None
+            hour_pct = (hour_count / max(1, self.max_per_hour)) * 100.0
+            day_pct = (day_count / max(1, self.max_per_day)) * 100.0
+            max_pct = max(hour_pct, day_pct)
 
-        return "OK", None
+            acc_suffix = f" ({acc})" if len(targets) > 1 or acc != "user" else ""
 
-    def get_stats(self) -> dict:
+            if max_pct >= 100.0:
+                # Critical threshold
+                if now - self._last_critical_alert[acc] > 900.0:  # 15 minutes debounce
+                    self._last_critical_alert[acc] = now
+                    msg = (
+                        f"🚨 <b>WhatsApp Account Health CRITICAL{acc_suffix}</b>\n\n"
+                        f"Message volume has reached safety limits for account <code>{acc}</code>!\n"
+                        f"• <b>Last 1 Hour:</b> <code>{hour_count} / {self.max_per_hour}</code> ({hour_pct:.1f}%)\n"
+                        f"• <b>Last 24 Hours:</b> <code>{day_count} / {self.max_per_day}</code> ({day_pct:.1f}%)\n"
+                        f"• <b>Active Queue Depth:</b> <code>{self.active_queue_depth}</code>\n\n"
+                        "⚠️ <i>Emergency rate throttling engaged (2.5x delay) to protect account from automated WhatsApp spam bans.</i>"
+                    )
+                    highest_status = "CRITICAL"
+                    highest_msg = msg
+                else:
+                    if highest_status != "CRITICAL":
+                        highest_status = "CRITICAL"
+
+            elif max_pct >= self.alert_threshold_percent:
+                # Warning threshold
+                if now - self._last_warning_alert[acc] > 1800.0:  # 30 minutes debounce
+                    self._last_warning_alert[acc] = now
+                    msg = (
+                        f"⚠️ <b>WhatsApp Account Health Warning{acc_suffix}</b>\n\n"
+                        f"Broadcast volume is approaching safety thresholds for account <code>{acc}</code>:\n"
+                        f"• <b>Last 1 Hour:</b> <code>{hour_count} / {self.max_per_hour}</code> ({hour_pct:.1f}%)\n"
+                        f"• <b>Last 24 Hours:</b> <code>{day_count} / {self.max_per_day}</code> ({day_pct:.1f}%)\n"
+                        f"• <b>Active Queue Depth:</b> <code>{self.active_queue_depth}</code>\n\n"
+                        "ℹ️ <i>Adaptive pacing automatically increased by 1.5x.</i>"
+                    )
+                    if highest_status != "CRITICAL":
+                        highest_status = "WARNING"
+                        highest_msg = msg
+                else:
+                    if highest_status == "OK":
+                        highest_status = "WARNING"
+
+        return highest_status, highest_msg
+
+    def get_stats(self, account_id: Optional[str] = None) -> dict:
         """Returns comprehensive diagnostic dictionary for admin reporting."""
         now = time.time()
-        self._prune_expired(now)
+        self._prune_expired(now, account_id=account_id)
 
-        hour_count = len(self.sliding_hour)
-        day_count = len(self.sliding_day)
-        hour_pct = (hour_count / max(1, self.max_per_hour)) * 100.0
-        day_pct = (day_count / max(1, self.max_per_day)) * 100.0
+        if account_id:
+            h_deque = self.account_sliding_hour.get(account_id, deque())
+            d_deque = self.account_sliding_day.get(account_id, deque())
+            hour_count = len(h_deque)
+            day_count = len(d_deque)
+            hour_pct = (hour_count / max(1, self.max_per_hour)) * 100.0
+            day_pct = (day_count / max(1, self.max_per_day)) * 100.0
+            status = "CRITICAL" if max(hour_pct, day_pct) >= 100 else ("WARNING" if max(hour_pct, day_pct) >= self.alert_threshold_percent else "HEALTHY")
+
+            return {
+                "account_id": account_id,
+                "hour_count": hour_count,
+                "max_per_hour": self.max_per_hour,
+                "hour_percent": round(hour_pct, 1),
+                "day_count": day_count,
+                "max_per_day": self.max_per_day,
+                "day_percent": round(day_pct, 1),
+                "active_queue_depth": self.active_queue_depth,
+                "tracked_recipients": len(self.recipient_buckets),
+                "status": status,
+            }
+
+        # Otherwise aggregate pool stats
+        accounts_stats = {}
+        total_hour = 0
+        total_day = 0
+        worst_status = "HEALTHY"
+
+        all_accs = list(self.account_sliding_hour.keys())
+        if not all_accs:
+            all_accs = ["user"]
+
+        for acc in all_accs:
+            h_cnt = len(self.account_sliding_hour.get(acc, deque()))
+            d_cnt = len(self.account_sliding_day.get(acc, deque()))
+            total_hour += h_cnt
+            total_day += d_cnt
+            h_pct = (h_cnt / max(1, self.max_per_hour)) * 100.0
+            d_pct = (d_cnt / max(1, self.max_per_day)) * 100.0
+            acc_status = "CRITICAL" if max(h_pct, d_pct) >= 100 else ("WARNING" if max(h_pct, d_pct) >= self.alert_threshold_percent else "HEALTHY")
+            if acc_status == "CRITICAL":
+                worst_status = "CRITICAL"
+            elif acc_status == "WARNING" and worst_status != "CRITICAL":
+                worst_status = "WARNING"
+
+            accounts_stats[acc] = {
+                "hour_count": h_cnt,
+                "max_per_hour": self.max_per_hour,
+                "hour_percent": round(h_pct, 1),
+                "day_count": d_cnt,
+                "max_per_day": self.max_per_day,
+                "day_percent": round(d_pct, 1),
+                "status": acc_status,
+            }
+
+        num_accounts = max(1, len(all_accs))
+        pool_max_hour = num_accounts * self.max_per_hour
+        pool_max_day = num_accounts * self.max_per_day
+        pool_hour_pct = (total_hour / max(1, pool_max_hour)) * 100.0
+        pool_day_pct = (total_day / max(1, pool_max_day)) * 100.0
 
         return {
-            "hour_count": hour_count,
-            "max_per_hour": self.max_per_hour,
-            "hour_percent": round(hour_pct, 1),
-            "day_count": day_count,
-            "max_per_day": self.max_per_day,
-            "day_percent": round(day_pct, 1),
+            "hour_count": total_hour,
+            "max_per_hour": pool_max_hour,
+            "hour_percent": round(pool_hour_pct, 1),
+            "day_count": total_day,
+            "max_per_day": pool_max_day,
+            "day_percent": round(pool_day_pct, 1),
             "active_queue_depth": self.active_queue_depth,
             "tracked_recipients": len(self.recipient_buckets),
-            "status": "CRITICAL" if max(hour_pct, day_pct) >= 100 else ("WARNING" if max(hour_pct, day_pct) >= self.alert_threshold_percent else "HEALTHY"),
+            "status": worst_status,
+            "accounts": accounts_stats,
         }

@@ -126,6 +126,34 @@ def create_table():
         """
     )
 
+    # Table for permanently failed / archived DLQ records
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS archived_failures (
+            id INTEGER PRIMARY KEY,
+            channel_id TEXT,
+            group_id TEXT,
+            group_name TEXT,
+            content_type TEXT,
+            caption TEXT,
+            original_filename TEXT,
+            media_path TEXT,
+            reason TEXT,
+            file_size_bytes INTEGER DEFAULT 0,
+            retry_count INTEGER DEFAULT 0,
+            created_at TIMESTAMP,
+            archived_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    cursor.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_failed_messages_retry_count
+        ON failed_messages(retry_count)
+        """
+    )
+
     # Table for per-channel hourly traffic and audience analytics (Optimization 6.A)
     cursor.execute(
         """
@@ -221,6 +249,50 @@ def get_all_channels():
     channels = cursor.fetchall()
     connection.close()
     return [clean_id(ch[0]) for ch in channels if clean_id(ch[0])]
+
+
+def get_channels_overview() -> list[dict]:
+    """
+    Consolidates channel metadata (channel_id, is_paused, group_count)
+    into a single relational query to eliminate N+1 query storms in menus.
+    Returns:
+    [
+        {"channel_id": str, "is_paused": bool, "group_count": int},
+        ...
+    ]
+    """
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT 
+            ch.channel_id,
+            COALESCE(c.is_paused, 0) AS is_paused,
+            COUNT(DISTINCT g.group_id) AS group_count
+        FROM (
+            SELECT channel_id FROM channels
+            UNION
+            SELECT channel_id FROM channel_groups
+        ) ch
+        LEFT JOIN channels c ON ch.channel_id = c.channel_id
+        LEFT JOIN channel_groups g ON ch.channel_id = g.channel_id
+        GROUP BY ch.channel_id
+        ORDER BY ch.channel_id ASC
+        """
+    )
+    rows = cursor.fetchall()
+    connection.close()
+
+    result = []
+    for r in rows:
+        cid = clean_id(r[0])
+        if cid:
+            result.append({
+                "channel_id": cid,
+                "is_paused": bool(r[1] == 1),
+                "group_count": int(r[2]),
+            })
+    return result
 
 
 def get_groups_for_channel(channel_id):
@@ -503,9 +575,10 @@ def add_failed_message(
     return new_id
 
 
-def get_failed_messages(limit: int = 50) -> list[dict]:
+def get_failed_messages(limit: int = 50, max_retries: int = 3) -> list[dict]:
     """
-    Retrieves queued failed messages from the DLQ ordered chronologically.
+    Retrieves queued failed messages from the DLQ ordered by retry_count ASC, id ASC.
+    Only retrieves active items that have not exceeded max_retries.
     """
     connection = get_connection()
     cursor = connection.cursor()
@@ -515,10 +588,11 @@ def get_failed_messages(limit: int = 50) -> list[dict]:
                caption, original_filename, media_path, reason,
                file_size_bytes, retry_count, created_at
         FROM failed_messages
-        ORDER BY id ASC
+        WHERE retry_count < ?
+        ORDER BY retry_count ASC, id ASC
         LIMIT ?
         """,
-        (limit,),
+        (max_retries, limit),
     )
     rows = cursor.fetchall()
     connection.close()
@@ -539,6 +613,70 @@ def get_failed_messages(limit: int = 50) -> list[dict]:
         }
         for r in rows
     ]
+
+
+def increment_failed_message_retry(
+    msg_id: int, reason: str | None = None, max_retries: int = 3
+) -> int:
+    """
+    Increments retry_count for a failed message.
+    If retry_count reaches or exceeds max_retries, moves the record to archived_failures
+    and deletes it from failed_messages. Unlinks associated media_path if unrecoverable.
+    Returns the updated retry_count.
+    """
+    connection = get_connection()
+    cursor = connection.cursor()
+
+    if reason:
+        cursor.execute(
+            "UPDATE failed_messages SET retry_count = retry_count + 1, reason = ? WHERE id = ?",
+            (str(reason), msg_id),
+        )
+    else:
+        cursor.execute(
+            "UPDATE failed_messages SET retry_count = retry_count + 1 WHERE id = ?",
+            (msg_id,),
+        )
+
+    cursor.execute(
+        """
+        SELECT id, channel_id, group_id, group_name, content_type,
+               caption, original_filename, media_path, reason,
+               file_size_bytes, retry_count, created_at
+        FROM failed_messages WHERE id = ?
+        """,
+        (msg_id,),
+    )
+    row = cursor.fetchone()
+
+    new_count = 0
+    if row:
+        new_count = row[10]
+        if new_count >= max_retries:
+            # Archive permanently failed message
+            cursor.execute(
+                """
+                INSERT OR REPLACE INTO archived_failures (
+                    id, channel_id, group_id, group_name, content_type,
+                    caption, original_filename, media_path, reason,
+                    file_size_bytes, retry_count, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                row,
+            )
+            cursor.execute("DELETE FROM failed_messages WHERE id = ?", (msg_id,))
+
+            # Clean up unrecoverable DLQ media file if on disk
+            media_path = row[7]
+            if media_path and os.path.exists(media_path):
+                try:
+                    os.remove(media_path)
+                except Exception:
+                    pass
+
+    connection.commit()
+    connection.close()
+    return new_count
 
 
 def delete_failed_message(msg_id: int):
@@ -563,13 +701,25 @@ def clear_failed_messages():
     connection.close()
 
 
-def get_failed_messages_count() -> int:
+def get_failed_messages_count(max_retries: int = 3) -> int:
     """
-    Returns the total number of items currently in the Dead-Letter Queue.
+    Returns the total number of active pending items currently in the Dead-Letter Queue (retry_count < max_retries).
     """
     connection = get_connection()
     cursor = connection.cursor()
-    cursor.execute("SELECT COUNT(*) FROM failed_messages")
+    cursor.execute("SELECT COUNT(*) FROM failed_messages WHERE retry_count < ?", (max_retries,))
+    count = cursor.fetchone()[0]
+    connection.close()
+    return count
+
+
+def get_archived_failures_count() -> int:
+    """
+    Returns the total number of permanently failed / archived items.
+    """
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute("SELECT COUNT(*) FROM archived_failures")
     count = cursor.fetchone()[0]
     connection.close()
     return count
