@@ -22,6 +22,7 @@
     "multer": "^1.4.5-lts.1",
     "pino": "^8.21.0",
     "sharp": "^0.33.5",
+    "socks-proxy-agent": "^8.0.5",
     "tsx": "^4.11.2"
   },
   "devDependencies": {

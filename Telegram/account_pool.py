@@ -41,6 +41,13 @@ class AccountPool:
                 "today_dispatched": 0,
                 "degraded_until": 0.0,
                 "last_used_at": 0.0,
+                "has_proxy": False,
+                "proxy_host": None,
+                "proxy_exit_ip": None,
+                "proxy_country": None,
+                "proxy_country_code": None,
+                "proxy_latency_ms": None,
+                "proxy_status": "direct",
             }
             for acc_id in CONFIGURED_ACCOUNTS
         }
@@ -80,6 +87,13 @@ class AccountPool:
                 target["status"] = str(acc.get("status", "unknown"))
                 target["phone"] = acc.get("phone")
                 target["name"] = acc.get("name")
+                target["has_proxy"] = bool(acc.get("hasProxy", False))
+                target["proxy_host"] = acc.get("proxyHost")
+                target["proxy_exit_ip"] = acc.get("proxyExitIp")
+                target["proxy_country"] = acc.get("proxyCountry")
+                target["proxy_country_code"] = acc.get("proxyCountryCode")
+                target["proxy_latency_ms"] = acc.get("proxyLatencyMs")
+                target["proxy_status"] = acc.get("proxyStatus", "direct" if not target["has_proxy"] else "healthy")
 
     def get_ready_accounts(self) -> list[str]:
         """Returns list of currently ready, non-degraded account IDs."""
@@ -172,6 +186,30 @@ class AccountPool:
             name_str = f' ("{acc["name"]}")' if acc["name"] else ""
 
             lines.append(f"• <b>{acc['label']}</b>: {badge}")
+
+            # Residential Proxy metadata
+            if acc.get("has_proxy"):
+                host_str = acc.get("proxy_host") or "Configured"
+                exit_ip = acc.get("proxy_exit_ip")
+                country = acc.get("proxy_country") or ""
+                latency = f" - {acc['proxy_latency_ms']}ms" if acc.get("proxy_latency_ms") else ""
+
+                flag = ""
+                code = (acc.get("proxy_country_code") or "").upper()
+                if code == "US": flag = "🇺🇸 "
+                elif code in ("GB", "UK"): flag = "🇬🇧 "
+                elif code == "DE": flag = "🇩🇪 "
+                elif code == "CA": flag = "🇨🇦 "
+                elif code == "FR": flag = "🇫🇷 "
+                elif code == "IN": flag = "🇮🇳 "
+
+                if exit_ip:
+                    lines.append(f"  └ 🌐 Proxy: <code>{exit_ip}</code> ({flag}{country}{latency})")
+                else:
+                    lines.append(f"  └ 🌐 Proxy: <code>{host_str}</code> (Active)")
+            else:
+                lines.append("  └ 🌐 Proxy: <i>Direct (Host VPS IP)</i>")
+
             if acc["is_ready"]:
                 lines.append(f"  └ 📞 <code>{phone_str}</code>{name_str}")
                 lines.append(f"  └ 📤 Dispatched Today: <b>{acc['today_dispatched']} msgs</b>")

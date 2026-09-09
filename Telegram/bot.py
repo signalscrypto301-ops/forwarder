@@ -204,6 +204,7 @@ from handlers.accounts import (
     _perform_logout_for_account,
     accounts_command,
     account_pool_callback_handler,
+    proxy_command,
     login_whatsapp,
     logout_whatsapp,
     listen_whatsapp,

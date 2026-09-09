@@ -121,6 +121,7 @@ async def help_command(message: Message):
         "• 📱 /accounts <i>(alias: /sessions, /pool)</i> — Multi-account pool dashboard & sender manager\n"
         "• 🔑 /login [1-4] — Generate WhatsApp QR code for Account 1, 2, 3, or 4\n"
         "• 🚪 /logout [1-4] — Disconnect and clean a specific WhatsApp session\n"
+        "• 🌐 /proxy [1-4] — Test and inspect active residential proxy connection per slot\n"
         "• 🎧 /listen — Toggle listening to incoming WhatsApp messages\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🌟 <b>INTERACTIVE PANEL FEATURES (/channels):</b>\n"

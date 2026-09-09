@@ -1,4 +1,4 @@
-﻿import unittest
+import unittest
 import asyncio
 import time
 import sys
@@ -124,7 +124,79 @@ class TestAccountPool(unittest.TestCase):
         self.assertIn("Dispatched Today", card)
         self.assertIn("1 msgs", card)
         self.assertIn("Waiting for QR Scan", card)
+        self.assertIn("Direct (Host VPS IP)", card)
+
+    def test_proxy_syncing_and_card_display(self):
+        mock_api_data = {
+            "accounts": [
+                {
+                    "id": "user",
+                    "index": 1,
+                    "isReady": True,
+                    "status": "ready",
+                    "phone": "+1234567890",
+                    "hasProxy": True,
+                    "proxyExitIp": "198.51.100.42",
+                    "proxyCountry": "United States",
+                    "proxyCountryCode": "US",
+                    "proxyLatencyMs": 85,
+                    "proxyStatus": "healthy",
+                },
+                {
+                    "id": "account2",
+                    "index": 2,
+                    "isReady": True,
+                    "status": "ready",
+                    "hasProxy": True,
+                    "proxyExitIp": "203.0.113.19",
+                    "proxyCountry": "Germany",
+                    "proxyCountryCode": "DE",
+                    "proxyLatencyMs": 140,
+                    "proxyStatus": "healthy",
+                },
+                {
+                    "id": "account3",
+                    "index": 3,
+                    "isReady": False,
+                    "status": "disconnected",
+                    "hasProxy": True,
+                    "proxyStatus": "healthy",
+                    "proxyExitIp": "192.0.2.1",
+                },
+            ]
+        }
+        self.pool.sync_from_api_response(mock_api_data)
+
+        user_info = self.pool.get_account_info("user")
+        self.assertTrue(user_info["has_proxy"])
+        self.assertEqual(user_info["proxy_exit_ip"], "198.51.100.42")
+        self.assertEqual(user_info["proxy_country"], "United States")
+        self.assertEqual(user_info["proxy_country_code"], "US")
+        self.assertEqual(user_info["proxy_latency_ms"], 85)
+        self.assertEqual(user_info["proxy_status"], "healthy")
+
+        acc2_info = self.pool.get_account_info("account2")
+        self.assertEqual(acc2_info["proxy_country"], "Germany")
+        self.assertEqual(acc2_info["proxy_latency_ms"], 140)
+
+        card = self.pool.format_dashboard_card()
+        # Check Account 1 proxy display
+        self.assertIn("198.51.100.42", card)
+        self.assertIn("United States", card)
+        self.assertIn("85ms", card)
+
+        # Check Account 2 proxy display
+        self.assertIn("203.0.113.19", card)
+        self.assertIn("Germany", card)
+        self.assertIn("140ms", card)
+
+        # Check Account 3 proxy display
+        self.assertIn("192.0.2.1", card)
+
+        # Account 4 has no proxy configured -> Direct
+        self.assertIn("Direct (Host VPS IP)", card)
 
 
 if __name__ == "__main__":
     unittest.main()
+

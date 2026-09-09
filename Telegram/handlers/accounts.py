@@ -11,12 +11,17 @@ from aiogram.types import (
 
 import config
 from logger import logger
-from account_pool import ACCOUNT_INDICES
+from account_pool import ACCOUNT_INDICES, ACCOUNT_LABELS
 from services.whatsapp import (
     post_whatsapp_json,
     generate_qr_code,
     _sync_account_pool_now,
 )
+
+try:
+    import aiohttp
+except ImportError:
+    aiohttp = None
 
 
 from bot_context import get_bot_module as _get_bot_module
@@ -44,7 +49,8 @@ def build_accounts_keyboard() -> InlineKeyboardMarkup:
     IKB = _get_ikb()
     keyboard = IKM(row_width=2)
     keyboard.row(
-        IKB("🔄 Refresh Status", callback_data="cb:acc:refresh")
+        IKB("🔄 Refresh Status", callback_data="cb:acc:refresh"),
+        IKB("🌐 Test Proxies", callback_data="cb:acc:proxy_test"),
     )
     keyboard.row(
         IKB("🔑 Login Account...", callback_data="cb:acc:login_menu"),
@@ -266,6 +272,12 @@ async def account_pool_callback_handler(call: CallbackQuery):
             await status_cmd(call.message)
         return
 
+    elif action == "proxy_test":
+        await call.answer("🔍 Probing proxies...", show_alert=False)
+        proxy_cmd = getattr(bot_mod, "proxy_command", proxy_command) if bot_mod else proxy_command
+        await proxy_cmd(call.message)
+        return
+
     elif action.startswith("login:"):
         idx_str = action.split(":", 1)[1]
         try:
@@ -287,6 +299,80 @@ async def account_pool_callback_handler(call: CallbackQuery):
         logout_fn = getattr(bot_mod, "_perform_logout_for_account", _perform_logout_for_account) if bot_mod else _perform_logout_for_account
         await logout_fn(call, idx)
         return
+
+
+async def proxy_command(message: Message):
+    if not message.chat.type == "private" or not _is_admin(message.from_user.id):
+        return
+
+    bot_mod = _get_bot_module()
+    pool = getattr(bot_mod, "account_pool", None)
+    sync_fn = getattr(bot_mod, "_sync_account_pool_now", _sync_account_pool_now) if bot_mod else _sync_account_pool_now
+    await sync_fn()
+
+    args = message.get_args() if hasattr(message, "get_args") else ""
+    target_idx = None
+    if args and args.strip():
+        try:
+            target_idx = int(args.strip())
+        except ValueError:
+            target_idx = None
+
+    url_base = config.whatsapp_service.rstrip("/")
+    headers = {"x-api-key": config.api_secret} if config.api_secret else {}
+
+    lines = [
+        "🌐 <b>WhatsApp Multi-Account Proxy Diagnostics</b>",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    accounts_to_check = [target_idx] if target_idx in (1, 2, 3, 4) else [1, 2, 3, 4]
+
+    for idx in accounts_to_check:
+        acc_id = ACCOUNT_INDICES[idx]
+        label = ACCOUNT_LABELS[acc_id]
+        test_url = f"{url_base}/proxy-test?clientId={acc_id}"
+
+        if not aiohttp:
+            lines.append(f"• <b>{label}</b>: ℹ️ aiohttp unavailable for live diagnostic query")
+            continue
+
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=8)) as session:
+                async with session.get(test_url, headers=headers) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if data.get("proxyConfigured"):
+                            status_icon = "🟢" if data.get("status") == "healthy" else "🔴"
+                            country_flag = ""
+                            cc = (data.get("countryCode") or "").upper()
+                            if cc == "US": country_flag = "🇺🇸 "
+                            elif cc in ("GB", "UK"): country_flag = "🇬🇧 "
+                            elif cc == "DE": country_flag = "🇩🇪 "
+                            elif cc == "CA": country_flag = "🇨🇦 "
+                            elif cc == "FR": country_flag = "🇫🇷 "
+                            elif cc == "IN": country_flag = "🇮🇳 "
+
+                            lines.append(f"• <b>{label}</b>: {status_icon} <b>{str(data.get('status', 'unknown')).upper()}</b>")
+                            lines.append(f"  └ 🔗 Host: <code>{data.get('maskedHost')}</code> ({data.get('protocol', 'proxy')})")
+                            if data.get("exitIp"):
+                                lines.append(f"  └ 🌍 Exit IP: <code>{data.get('exitIp')}</code> ({country_flag}{data.get('country', 'Online')})")
+                            if data.get("latencyMs"):
+                                lines.append(f"  └ ⚡ Latency: <b>{data.get('latencyMs')}ms</b>")
+                            if data.get("error"):
+                                lines.append(f"  └ ⚠️ Error: <i>{data.get('error')}</i>")
+                        else:
+                            lines.append(f"• <b>{label}</b>: 🏠 <b>DIRECT</b> (Host VPS IP)")
+                            lines.append("  └ ℹ️ <i>No proxy configured. Using host broadband IP.</i>")
+                    else:
+                        lines.append(f"• <b>{label}</b>: ⚠️ Service returned HTTP {resp.status}")
+        except Exception as e:
+            lines.append(f"• <b>{label}</b>: ⚠️ Probe error ({e})")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("💡 <i>Tip: Set residential SOCKS5/HTTP proxies in docker-compose.yml or proxies.json to isolate IPs per account.</i>")
+
+    await message.reply("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
 async def login_whatsapp(message: Message):
@@ -370,6 +456,7 @@ async def logout_whatsapp(message: Message):
 
 def register_accounts_handlers(dp):
     dp.register_message_handler(accounts_command, commands=["accounts", "sessions", "pool"])
+    dp.register_message_handler(proxy_command, commands=["proxy", "proxies"])
     dp.register_message_handler(login_whatsapp, commands=["login"])
     dp.register_message_handler(logout_whatsapp, commands=["logout"])
     dp.register_message_handler(listen_whatsapp, commands=["listen"])

@@ -1,0 +1,6 @@
+{
+  "user": "socks5://username:password@us-residential.proxyprovider.com:1080",
+  "account2": "http://username:password@uk-residential.proxyprovider.com:8080",
+  "account3": "socks5://username:password@de-residential.proxyprovider.com:1080",
+  "account4": "http://username:password@ca-residential.proxyprovider.com:8080"
+}

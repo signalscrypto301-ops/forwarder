@@ -18,6 +18,8 @@ import path from "path";
 import mime from "mime-types";
 import sharp from "sharp";
 import { HttpsProxyAgent } from "https-proxy-agent";
+import { SocksProxyAgent } from "socks-proxy-agent";
+import axios from "axios";
 
 const app = express();
 const clientId: string = process.env.CLIENT_ID || "user";
@@ -55,6 +57,11 @@ interface SessionEntry {
     connectedAt?: string;
     hasProxy?: boolean;
     proxyHost?: string;
+    proxyExitIp?: string;
+    proxyCountry?: string;
+    proxyCountryCode?: string;
+    proxyLatencyMs?: number;
+    proxyStatus?: "healthy" | "failed" | "direct";
 }
 
 const sessions: Record<string, SessionEntry> = {};
@@ -108,6 +115,25 @@ function getAccountProxy(safeId: string): string | undefined {
     if (process.env[`PROXY_${upper}`]) {
         return process.env[`PROXY_${upper}`];
     }
+
+    // Check proxies.json configuration file if present
+    const candidateFiles = [
+        path.resolve("proxies.json"),
+        path.resolve(".baileys_auth", "proxies.json"),
+    ];
+    for (const pFile of candidateFiles) {
+        try {
+            if (fs.existsSync(pFile)) {
+                const map = JSON.parse(fs.readFileSync(pFile, "utf-8"));
+                if (map && typeof map === "object") {
+                    if (map[safeId]) return map[safeId];
+                    if (slotIndex && map[`account${slotIndex}`]) return map[`account${slotIndex}`];
+                    if (slotIndex && map[String(slotIndex)]) return map[String(slotIndex)];
+                }
+            }
+        } catch (_) {}
+    }
+
     return process.env.WHATSAPP_PROXY || process.env.GLOBAL_PROXY || undefined;
 }
 
@@ -117,6 +143,85 @@ function maskProxyUrl(proxyUrl: string): string {
         return `${u.protocol}//${u.host}`;
     } catch (_) {
         return proxyUrl.replace(/:[^:@]+@/, ":***@");
+    }
+}
+
+function createProxyAgent(proxyUrl: string): any {
+    const clean = proxyUrl.trim();
+    if (clean.startsWith("socks")) {
+        return new SocksProxyAgent(clean);
+    }
+    return new HttpsProxyAgent(clean);
+}
+
+interface ProxyProbeResult {
+    ok: boolean;
+    maskedHost: string;
+    protocol: string;
+    exitIp?: string;
+    country?: string;
+    countryCode?: string;
+    latencyMs?: number;
+    error?: string;
+}
+
+async function probeProxy(proxyUrl: string): Promise<ProxyProbeResult> {
+    const maskedHost = maskProxyUrl(proxyUrl);
+    const protocol = proxyUrl.split(":")[0];
+    const start = Date.now();
+    try {
+        const agent = createProxyAgent(proxyUrl);
+        const res = await axios.get("http://ip-api.com/json?fields=status,country,countryCode,query", {
+            httpAgent: agent,
+            httpsAgent: agent,
+            timeout: 5000,
+        });
+        const latencyMs = Date.now() - start;
+        if (res.data && res.data.status === "success") {
+            return {
+                ok: true,
+                maskedHost,
+                protocol,
+                exitIp: res.data.query,
+                country: res.data.country,
+                countryCode: res.data.countryCode,
+                latencyMs,
+            };
+        }
+        return {
+            ok: true,
+            maskedHost,
+            protocol,
+            exitIp: res.data?.query || "Active",
+            country: res.data?.country || "Online",
+            latencyMs,
+        };
+    } catch (err: any) {
+        try {
+            const agent = createProxyAgent(proxyUrl);
+            const fallbackRes = await axios.get("https://api.ipify.org?format=json", {
+                httpAgent: agent,
+                httpsAgent: agent,
+                timeout: 4000,
+            });
+            const latencyMs = Date.now() - start;
+            return {
+                ok: true,
+                maskedHost,
+                protocol,
+                exitIp: fallbackRes.data?.ip,
+                country: "Online",
+                latencyMs,
+            };
+        } catch (fallbackErr: any) {
+            return {
+                ok: false,
+                maskedHost,
+                protocol,
+                latencyMs: Date.now() - start,
+                error: err.message || "Proxy connection failed",
+            };
+        }
     }
 }
 
@@ -342,18 +447,36 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
     const proxyUrl = getAccountProxy(safeId);
     if (proxyUrl) {
         try {
-            agent = new HttpsProxyAgent(proxyUrl);
+            agent = createProxyAgent(proxyUrl);
             entry.hasProxy = true;
             entry.proxyHost = maskProxyUrl(proxyUrl);
-            console.log(`[${safeId}] 🌐 Dedicated proxy active: ${entry.proxyHost}`);
+            entry.proxyStatus = "healthy";
+
+            probeProxy(proxyUrl).then((probe) => {
+                if (probe.ok) {
+                    entry.proxyExitIp = probe.exitIp;
+                    entry.proxyCountry = probe.country;
+                    entry.proxyCountryCode = probe.countryCode;
+                    entry.proxyLatencyMs = probe.latencyMs;
+                    entry.proxyStatus = "healthy";
+                    console.log(`[${safeId}] 🌐 Proxy active: ${entry.proxyHost} -> Exit IP: ${probe.exitIp} (${probe.country || "Online"} - ${probe.latencyMs}ms)`);
+                } else {
+                    entry.proxyStatus = "failed";
+                    console.warn(`[${safeId}] ⚠️ Proxy probe failed for ${entry.proxyHost}: ${probe.error}`);
+                }
+            }).catch((err) => {
+                console.warn(`[${safeId}] Proxy probe background error:`, err);
+            });
         } catch (proxyErr) {
-            console.error(`[${safeId}] ⚠️ Failed to initialize proxy for ${maskProxyUrl(proxyUrl)}:`, proxyErr);
+            console.error(`[${safeId}] ⚠️ Failed to initialize proxy agent for ${maskProxyUrl(proxyUrl)}:`, proxyErr);
             entry.hasProxy = false;
             entry.proxyHost = undefined;
+            entry.proxyStatus = "failed";
         }
     } else {
         entry.hasProxy = false;
         entry.proxyHost = undefined;
+        entry.proxyStatus = "direct";
     }
 
     const sock = socketFactory({
@@ -478,6 +601,11 @@ app.get("/health", (req, res) => {
         clientId: safeId,
         hasProxy: Boolean(entry?.hasProxy),
         proxyHost: entry?.proxyHost || null,
+        proxyExitIp: entry?.proxyExitIp || null,
+        proxyCountry: entry?.proxyCountry || null,
+        proxyCountryCode: entry?.proxyCountryCode || null,
+        proxyLatencyMs: entry?.proxyLatencyMs || null,
+        proxyStatus: entry?.proxyStatus || (entry?.hasProxy ? "healthy" : "direct"),
         sessionsCount: Object.keys(sessions).length,
         timestamp: new Date().toISOString(),
         memory: {
@@ -528,6 +656,11 @@ app.get("/sessions", (req, res) => {
             hasPendingQR: Boolean(entry?.currentQR),
             hasProxy: Boolean(entry?.hasProxy),
             proxyHost: entry?.proxyHost || null,
+            proxyExitIp: entry?.proxyExitIp || null,
+            proxyCountry: entry?.proxyCountry || null,
+            proxyCountryCode: entry?.proxyCountryCode || null,
+            proxyLatencyMs: entry?.proxyLatencyMs || null,
+            proxyStatus: entry?.proxyStatus || (entry?.hasProxy ? "healthy" : "direct"),
         };
     });
 
@@ -537,6 +670,35 @@ app.get("/sessions", (req, res) => {
         accounts: accountsInfo,
         readyCount,
         totalConfigured: CONFIGURED_ACCOUNTS.length,
+        timestamp: new Date().toISOString(),
+    });
+});
+
+app.get("/proxy-test", async (req, res) => {
+    const safeId = sanitizeClientId(req.query.clientId || clientId);
+    const proxyUrl = getAccountProxy(safeId);
+    if (!proxyUrl) {
+        return res.json({
+            account: safeId,
+            proxyConfigured: false,
+            message: `No proxy configured for account slot '${safeId}'. Operating directly via host IP.`,
+            status: "direct",
+            timestamp: new Date().toISOString(),
+        });
+    }
+
+    const probe = await probeProxy(proxyUrl);
+    res.json({
+        account: safeId,
+        proxyConfigured: true,
+        maskedHost: probe.maskedHost,
+        protocol: probe.protocol,
+        status: probe.ok ? "healthy" : "failed",
+        exitIp: probe.exitIp || null,
+        country: probe.country || null,
+        countryCode: probe.countryCode || null,
+        latencyMs: probe.latencyMs || null,
+        error: probe.error || null,
         timestamp: new Date().toISOString(),
     });
 });

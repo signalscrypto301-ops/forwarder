@@ -10,6 +10,10 @@ services:
       - API_SECRET=forwarder_internal_secret_key_8f3a92b
       - PORT=5426
       - CLIENT_ID=user
+      - ACCOUNT_1_PROXY=${ACCOUNT_1_PROXY:-}
+      - ACCOUNT_2_PROXY=${ACCOUNT_2_PROXY:-}
+      - ACCOUNT_3_PROXY=${ACCOUNT_3_PROXY:-}
+      - ACCOUNT_4_PROXY=${ACCOUNT_4_PROXY:-}
     volumes:
       - ./Whatsapp/.baileys_auth:/app/.baileys_auth
       - ./Whatsapp/uploads:/app/uploads
