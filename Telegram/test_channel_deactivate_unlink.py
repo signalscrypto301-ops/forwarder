@@ -374,7 +374,10 @@ class TestChannelDeactivateAndUnlink(unittest.IsolatedAsyncioTestCase):
             self.assertIn("/get_chat_id", help_text)
             self.assertIn("/watchdog", help_text)
             self.assertIn("/health_stats", help_text)
-            self.assertIn("/listen", help_text)
+            self.assertIn("/audit_admins", help_text)
+            self.assertIn("/proxy", help_text)
+            self.assertIn("/start", help_text)
+            self.assertIn("/help", help_text)
 
             # Verify details about deactivation and unlinking
             self.assertIn("Pause forwarding for a channel", help_text)
@@ -386,6 +389,43 @@ class TestChannelDeactivateAndUnlink(unittest.IsolatedAsyncioTestCase):
             self.assertIn("ACTIVE", help_text)
             self.assertIn("PAUSED", help_text)
             self.assertIn("DEACTIVATED", help_text)
+
+            # Verify interactive inline keyboard was attached
+            kwargs = msg.reply.call_args[1]
+            self.assertIn("reply_markup", kwargs)
+            self.assertIsNotNone(kwargs["reply_markup"])
+
+    async def test_help_callback_refreshes_message(self):
+        """Verify tapping 🔄 Refresh Help triggers handle_help_callback and updates the text."""
+        call = MagicMock()
+        call.from_user.id = 12345
+        call.data = "cb:help:refresh"
+        call.answer = AsyncMock()
+        call.message.edit_text = AsyncMock()
+
+        with patch.object(bot, "is_admin", return_value=True):
+            await bot.handle_help_callback(call)
+            call.answer.assert_called_once()
+            call.message.edit_text.assert_called_once()
+            edited_text = call.message.edit_text.call_args[0][0]
+            self.assertIn("Forwarder Master Command Directory & Guide", edited_text)
+            self.assertIn("/channels", edited_text)
+            self.assertIn("/audit_admins", edited_text)
+
+    async def test_setup_bot_commands_invoked(self):
+        """Verify setup_bot_commands registers slash commands with Bot instance."""
+        mock_bot = MagicMock()
+        mock_bot.set_my_commands = AsyncMock()
+        await bot.setup_bot_commands(mock_bot)
+        mock_bot.set_my_commands.assert_called_once()
+        cmd_list = mock_bot.set_my_commands.call_args[0][0]
+        cmd_names = [c.command for c in cmd_list]
+        self.assertIn("help", cmd_names)
+        self.assertIn("channels", cmd_names)
+        self.assertIn("audit_admins", cmd_names)
+        self.assertIn("status", cmd_names)
+        self.assertIn("proxy", cmd_names)
+        self.assertIn("accounts", cmd_names)
 
 
 if __name__ == "__main__":

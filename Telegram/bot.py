@@ -159,6 +159,10 @@ from handlers.admin import (
     is_admin,
     start_command,
     help_command,
+    build_help_keyboard,
+    get_help_text,
+    handle_help_callback,
+    setup_bot_commands,
     get_server_telemetry,
     status_command,
     telemetry_command,
@@ -241,6 +245,8 @@ async def handle_callback_query(call: CallbackQuery):
         return await handle_analytics_callbacks(call)
     if data == "cb:audit_admins":
         return await handle_audit_admins_callback(call)
+    if data == "cb:help:refresh":
+        return await handle_help_callback(call)
     if data.startswith("cb:acc:"):
         return await account_pool_callback_handler(call)
     if data in ("cb:dlq_refresh", "cb:dlq_purge", "cb:dlq_retry"):
@@ -264,6 +270,7 @@ register_forwarder_handlers(dp)
 async def on_startup(_):
     logger.info("Bot starting up...")
     cleanup_stale_media()
+    asyncio.create_task(setup_bot_commands(bot))
     asyncio.create_task(init_telethon_client())
     asyncio.create_task(periodic_cleanup_task())
     asyncio.create_task(scheduled_daily_report_loop())

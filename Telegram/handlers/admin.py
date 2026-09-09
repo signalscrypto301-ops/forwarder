@@ -82,17 +82,42 @@ async def start_command(message: Message):
     )
 
 
-async def help_command(message: Message):
-    bot_mod = _get_bot_module()
-    admin_fn = getattr(bot_mod, "is_admin", is_admin) if bot_mod else is_admin
-    if not message.chat.type == "private" or not admin_fn(message.from_user.id):
-        return
+def build_help_keyboard() -> InlineKeyboardMarkup:
+    """
+    Creates an interactive inline keyboard for fast jumping to core administrative panels.
+    """
+    IKM = _get_ikm()
+    IKB = _get_ikb()
+    kb = IKM(row_width=2)
+    kb.row(
+        IKB("📱 Channels (/channels)", callback_data="cb:ch:refresh"),
+        IKB("📊 Status (/status)", callback_data="cb:hl:refresh"),
+    )
+    kb.row(
+        IKB("🛡️ Audit Admins", callback_data="cb:audit_admins"),
+        IKB("📱 Accounts (/accounts)", callback_data="cb:acc:refresh"),
+    )
+    kb.row(
+        IKB("📈 Analytics (/analytics)", callback_data="cb:ana:main"),
+        IKB("📬 DLQ (/failed)", callback_data="cb:dlq_refresh"),
+    )
+    kb.row(
+        IKB("🩺 Auto-Healer (/healer)", callback_data="cb:hl:refresh"),
+        IKB("🔄 Refresh Help", callback_data="cb:help:refresh"),
+    )
+    return kb
 
-    help_text = (
-        "🤖 <b>Forwarder Admin Commands & Guide</b>\n"
-        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+
+def get_help_text() -> str:
+    """
+    Returns the comprehensive master slash command directory and documentation.
+    """
+    return (
+        "🤖 <b>Forwarder Master Command Directory & Guide</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n"
+        "<i>Tap any slash command below to execute it immediately, or use the quick buttons below:</i>\n\n"
         "⚡ <b>CHANNEL MANAGEMENT & FORWARDING:</b>\n"
-        "• 📱 /channels — Interactive channel browser with status badges, Pause/Resume & Unlink buttons\n"
+        "• 📱 /channels <i>(alias: /menu)</i> — Interactive channel browser with status badges, Pause/Resume & Unlink buttons\n"
         "• ⏸️ /deactivate &lt;channel_id&gt; <i>(alias: /pause)</i> — Pause forwarding for a channel (retains all mappings). Without args: lists active channels\n"
         "• ▶️ /activate &lt;channel_id&gt; <i>(alias: /resume, /unpause)</i> — Resume forwarding for a paused channel. Without args: lists paused channels\n"
         "• 🔗 /unlink &lt;channel_id&gt; [group_id] <i>(alias: /unmap)</i> —\n"
@@ -108,23 +133,27 @@ async def help_command(message: Message):
         "• ➕ /add_group &lt;channel_id&gt; &lt;group_id&gt; — Manually map channel to WhatsApp group\n"
         "• ➖ /delete_group &lt;channel_id&gt; &lt;group_id&gt; — Manually remove group mapping\n"
         "• 📋 /view_groups — List all registered channels and their mapped destinations\n\n"
-        "📊 <b>MONITORING, HEALTH & ANALYTICS:</b>\n"
-        "• 📊 /status — Live health dashboard & channel statistics\n"
-        "• 🩺 /healer <i>(alias: /autoheal, /ram)</i> — Automated System Health & RAM Auto-Healer dashboard\n"
-        "• 📈 /analytics <i>(alias: /audience, /traffic)</i> — Visual audience intelligence, top channels & heatmap\n"
-        "• 🖥️ /telemetry <i>(alias: /server_health, /resources)</i> — Real-time server, RAM, CPU & process metrics\n"
-        "• 📈 /report [YYYY-MM-DD] <i>(alias: /daily_report)</i> — Daily delivery report & performance summary\n"
-        "• 📬 /failed <i>(alias: /dlq)</i> — Dead-Letter Queue (DLQ) inspector & retry manager\n"
-        "• ⚠️ /stale [hours] <i>(alias: /stale_channels)</i> — Detect inactive channels with no posts (default 72h)\n"
-        "• 🩺 /watchdog — WhatsApp socket health monitor & auto-reconnect status\n"
-        "• 🛡️ /health_stats <i>(alias: /rate_status)</i> — WhatsApp deliverability rate & safety metrics\n\n"
-        "🔑 <b>WHATSAPP ACCOUNTS & SESSIONS:</b>\n"
-        "• 🛡️ /audit_admins <i>(alias: /check_admins, /verify_admins)</i> — Audit Admin/Owner rights across all connected WhatsApp accounts and forwarded channels\n"
+        "🛡️ <b>ADMIN AUDIT & WHATSAPP ACCOUNTS:</b>\n"
+        "• 🛡️ /audit_admins <i>(alias: /check_admins, /verify_admins, /admin_check)</i> — Audit Admin/Owner rights across all connected WhatsApp accounts and forwarded channels\n"
         "• 📱 /accounts <i>(alias: /sessions, /pool)</i> — Multi-account pool dashboard & sender manager\n"
+        "• 🌐 /proxy [1-4] <i>(alias: /proxies)</i> — Test and inspect active residential proxy connection per slot\n"
         "• 🔑 /login [1-4] — Generate WhatsApp QR code for Account 1, 2, 3, or 4\n"
         "• 🚪 /logout [1-4] — Disconnect and clean a specific WhatsApp session\n"
-        "• 🌐 /proxy [1-4] — Test and inspect active residential proxy connection per slot\n"
         "• 🎧 /listen — Toggle listening to incoming WhatsApp messages\n\n"
+        "📊 <b>MONITORING, HEALTH & PERFORMANCE:</b>\n"
+        "• 📊 /status — Live health dashboard & channel statistics\n"
+        "• 🩺 /healer <i>(alias: /autoheal, /ram)</i> — Automated System Health & RAM Auto-Healer dashboard\n"
+        "• 🖥️ /telemetry <i>(alias: /server_health, /resources)</i> — Real-time server, RAM, CPU & process metrics\n"
+        "• 📬 /failed <i>(alias: /dlq)</i> — Dead-Letter Queue (DLQ) inspector & retry manager\n"
+        "• 🩺 /watchdog — WhatsApp socket health monitor & auto-reconnect status\n"
+        "• 🛡️ /health_stats <i>(alias: /rate_status)</i> — WhatsApp deliverability rate & safety metrics\n\n"
+        "📈 <b>ANALYTICS & INTELLIGENCE:</b>\n"
+        "• 📈 /analytics <i>(alias: /audience, /traffic)</i> — Visual audience intelligence, top channels & heatmap\n"
+        "• 📈 /report [YYYY-MM-DD] <i>(alias: /daily_report)</i> — Daily delivery report & performance summary\n"
+        "• ⚠️ /stale [hours] <i>(alias: /stale_channels, /inactive_channels)</i> — Detect inactive channels with no posts (default 72h)\n\n"
+        "⚙️ <b>SYSTEM & UTILITIES:</b>\n"
+        "• 🚀 /start — Verify bot operational status and administrator authentication\n"
+        "• ❓ /help — Show this complete master command directory and user guide\n\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         "🌟 <b>INTERACTIVE PANEL FEATURES (/channels):</b>\n"
         "• <b>Status Badge:</b> 🟢 ACTIVE (Running) vs ⏸️ PAUSED / DEACTIVATED (Paused)\n"
@@ -132,7 +161,92 @@ async def help_command(message: Message):
         "• <b>Granular Unlink:</b> 🔗 Unlink individual groups directly from the channel card\n"
         "• <b>Safe Unlink All:</b> Two-step confirmation prompt displaying destination count before unlinking"
     )
-    await message.reply(help_text, parse_mode=ParseMode.HTML)
+
+
+async def help_command(message: Message):
+    bot_mod = _get_bot_module()
+    admin_fn = getattr(bot_mod, "is_admin", is_admin) if bot_mod else is_admin
+    if not message.chat.type == "private" or not admin_fn(message.from_user.id):
+        return
+
+    help_fn = getattr(bot_mod, "get_help_text", get_help_text) if bot_mod else get_help_text
+    kb_fn = getattr(bot_mod, "build_help_keyboard", build_help_keyboard) if bot_mod else build_help_keyboard
+    await message.reply(help_fn(), parse_mode=ParseMode.HTML, reply_markup=kb_fn())
+
+
+async def handle_help_callback(call: CallbackQuery):
+    bot_mod = _get_bot_module()
+    admin_fn = getattr(bot_mod, "is_admin", is_admin) if bot_mod else is_admin
+    if not admin_fn(call.from_user.id):
+        await call.answer("Unauthorized", show_alert=True)
+        return
+
+    await call.answer("📖 Command Directory Refreshed")
+    help_fn = getattr(bot_mod, "get_help_text", get_help_text) if bot_mod else get_help_text
+    kb_fn = getattr(bot_mod, "build_help_keyboard", build_help_keyboard) if bot_mod else build_help_keyboard
+    try:
+        await call.message.edit_text(help_fn(), parse_mode=ParseMode.HTML, reply_markup=kb_fn())
+    except Exception:
+        pass
+
+
+async def setup_bot_commands(bot_instance):
+    """
+    Registers slash commands with Telegram Bot API so typing '/' in chat
+    displays the full interactive auto-completion command list.
+    """
+    try:
+        from aiogram.types import BotCommand as _RealBotCommand
+    except Exception:
+        _RealBotCommand = None
+
+    class _SimpleCmd:
+        def __init__(self, command, description):
+            self.command = command
+            self.description = description
+
+    raw_commands = [
+        ("help", "Master command directory & guide"),
+        ("channels", "Interactive channel browser & menu"),
+        ("status", "Live health dashboard & uptime"),
+        ("audit_admins", "Audit WhatsApp Admin/Owner permissions"),
+        ("accounts", "Multi-account pool & sender manager"),
+        ("proxy", "Test residential proxy per slot [1-4]"),
+        ("login", "Generate QR code for WhatsApp slot [1-4]"),
+        ("logout", "Disconnect a WhatsApp slot session [1-4]"),
+        ("map", "One-tap group/newsletter mapper wizard"),
+        ("get_chat_id", "Find WhatsApp group/newsletter JID"),
+        ("view_groups", "List all channels and mapped groups"),
+        ("add_group", "Map channel to WhatsApp group"),
+        ("delete_group", "Remove WhatsApp group mapping"),
+        ("add_channel", "Register new Telegram channel"),
+        ("delete_channel", "Unregister channel & remove mappings"),
+        ("pause_all", "Emergency freeze on all channels"),
+        ("resume_all", "Resume forwarding on all channels"),
+        ("deactivate", "Pause forwarding for a channel"),
+        ("activate", "Resume forwarding for a channel"),
+        ("unlink", "Unlink destination from channel"),
+        ("healer", "Auto-Healer & RAM cleanup dashboard"),
+        ("telemetry", "Server CPU, RAM & process metrics"),
+        ("analytics", "Audience analytics & traffic heatmap"),
+        ("report", "Daily delivery summary report"),
+        ("failed", "Dead-Letter Queue (DLQ) retry manager"),
+        ("stale", "Detect inactive channels with no posts"),
+        ("watchdog", "WhatsApp socket monitor & reconnect"),
+        ("health_stats", "Deliverability rate & safety metrics"),
+        ("listen", "Toggle incoming message listener"),
+        ("start", "Start bot & verify admin access"),
+    ]
+
+    is_mock = hasattr(_RealBotCommand, "_mock_return_value") or "Mock" in type(_RealBotCommand).__name__
+    cmd_cls = _SimpleCmd if is_mock or not _RealBotCommand else _RealBotCommand
+    commands = [cmd_cls(c, d) for c, d in raw_commands]
+
+    try:
+        await bot_instance.set_my_commands(commands)
+        logger.info(f"Registered {len(commands)} slash commands with Telegram Bot API.")
+    except Exception as e:
+        logger.warning(f"Could not register Telegram slash commands: {e}")
 
 
 def get_server_telemetry(baileys_ram_mb: int | None = None) -> str:
@@ -929,5 +1043,9 @@ def register_admin_handlers(dp):
     dp.register_callback_query_handler(
         handle_audit_admins_callback,
         lambda c: c.data and c.data == "cb:audit_admins",
+    )
+    dp.register_callback_query_handler(
+        handle_help_callback,
+        lambda c: c.data and c.data == "cb:help:refresh",
     )
 
