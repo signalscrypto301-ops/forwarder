@@ -62,6 +62,7 @@ interface SessionEntry {
     proxyCountryCode?: string;
     proxyLatencyMs?: number;
     proxyStatus?: "healthy" | "failed" | "direct";
+    qrTimestamp?: number;
 }
 
 const sessions: Record<string, SessionEntry> = {};
@@ -549,6 +550,7 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
         if (qr) {
             console.log(`[${safeId}] QR generated`);
             entry.currentQR = qr;
+            entry.qrTimestamp = Date.now();
             const listeners = [...entry.qrListeners];
             entry.qrListeners = [];
             listeners.forEach((fn) => fn(qr));
@@ -841,11 +843,13 @@ app.post("/createsession", async (req, res) => {
     }
 
     let entry = existing;
-    if (!entry || !entry.sock) {
-        entry = await createOrRestartSession(targetId);
-    }
+    const isQrFresh = Boolean(entry?.currentQR && entry?.qrTimestamp && (Date.now() - entry.qrTimestamp < 20000));
 
-    if (entry.currentQR) {
+    if (!entry || !entry.sock || (!entry.isReady && !isQrFresh)) {
+        console.log(`[${targetId}] Starting fresh socket to generate login QR code...`);
+        entry = await createOrRestartSession(targetId);
+    } else if (isQrFresh && entry.currentQR) {
+        console.log(`[${targetId}] Returning active fresh QR code`);
         return res.json({ qrcode: entry.currentQR });
     }
 

@@ -5,6 +5,46 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+from unittest.mock import MagicMock, AsyncMock, patch
+
+for mod in [
+    "yaml",
+    "aiogram",
+    "aiogram.utils",
+    "aiogram.utils.executor",
+    "aiogram.types",
+    "telethon",
+    "telethon.sessions",
+    "qrcode",
+    "aiohttp",
+    "requests",
+    "psutil",
+]:
+    if mod not in sys.modules:
+        sys.modules[mod] = MagicMock()
+
+class MockInlineKeyboardMarkup:
+    def __init__(self, row_width=1):
+        self.inline_keyboard = []
+        self.row_width = row_width
+
+    def add(self, *buttons):
+        for b in buttons:
+            self.inline_keyboard.append([b])
+
+    def row(self, *buttons):
+        self.inline_keyboard.append(list(buttons))
+
+
+class MockInlineKeyboardButton:
+    def __init__(self, text="", callback_data=""):
+        self.text = text
+        self.callback_data = callback_data
+
+sys.modules["aiogram.types"].InlineKeyboardMarkup = MockInlineKeyboardMarkup
+sys.modules["aiogram.types"].InlineKeyboardButton = MockInlineKeyboardButton
+
 from account_pool import AccountPool, CONFIGURED_ACCOUNTS, ID_TO_INDEX, ACCOUNT_INDICES
 
 
@@ -195,6 +235,74 @@ class TestAccountPool(unittest.TestCase):
 
         # Account 4 has no proxy configured -> Direct
         self.assertIn("Direct (Host VPS IP)", card)
+
+    def test_build_account_select_keyboard_has_all_4_accounts(self):
+        from handlers.accounts import build_account_select_keyboard
+        kb = build_account_select_keyboard("cb:acc:login")
+        callbacks = [btn.callback_data for row in kb.inline_keyboard for btn in row]
+        self.assertIn("cb:acc:login:1", callbacks)
+        self.assertIn("cb:acc:login:2", callbacks)
+        self.assertIn("cb:acc:login:3", callbacks)
+        self.assertIn("cb:acc:login:4", callbacks)
+        self.assertIn("cb:acc:back", callbacks)
+
+    def test_login_whatsapp_command_parsing(self):
+        from unittest.mock import AsyncMock, MagicMock, patch
+        import handlers.accounts as acc_handlers
+        bot_mod = sys.modules.get("bot")
+
+        # Test with /login 2
+        msg = MagicMock()
+        msg.chat.type = "private"
+        msg.from_user.id = 12345
+        msg.get_args.return_value = "2"
+        msg.text = "/login 2"
+        msg.reply = AsyncMock()
+
+        mock_login = AsyncMock()
+        with patch.object(acc_handlers, "_is_admin", return_value=True), \
+             patch.object(acc_handlers, "_perform_login_for_account", mock_login):
+            if bot_mod and hasattr(bot_mod, "_perform_login_for_account"):
+                with patch.object(bot_mod, "_perform_login_for_account", mock_login):
+                    asyncio.run(acc_handlers.login_whatsapp(msg))
+            else:
+                asyncio.run(acc_handlers.login_whatsapp(msg))
+            mock_login.assert_awaited_once_with(msg, 2)
+
+        # Test with /login2
+        msg2 = MagicMock()
+        msg2.chat.type = "private"
+        msg2.from_user.id = 12345
+        msg2.get_args.return_value = ""
+        msg2.text = "/login2"
+        msg2.reply = AsyncMock()
+
+        mock_login2 = AsyncMock()
+        with patch.object(acc_handlers, "_is_admin", return_value=True), \
+             patch.object(acc_handlers, "_perform_login_for_account", mock_login2):
+            if bot_mod and hasattr(bot_mod, "_perform_login_for_account"):
+                with patch.object(bot_mod, "_perform_login_for_account", mock_login2):
+                    asyncio.run(acc_handlers.login_whatsapp(msg2))
+            else:
+                asyncio.run(acc_handlers.login_whatsapp(msg2))
+            mock_login2.assert_awaited_once_with(msg2, 2)
+
+        # Test with bare message "3"
+        msg3 = MagicMock()
+        msg3.chat.type = "private"
+        msg3.from_user.id = 12345
+        msg3.text = "3"
+        msg3.reply = AsyncMock()
+
+        mock_login3 = AsyncMock()
+        with patch.object(acc_handlers, "_is_admin", return_value=True), \
+             patch.object(acc_handlers, "_perform_login_for_account", mock_login3):
+            if bot_mod and hasattr(bot_mod, "_perform_login_for_account"):
+                with patch.object(bot_mod, "_perform_login_for_account", mock_login3):
+                    asyncio.run(acc_handlers.account_number_quick_login(msg3))
+            else:
+                asyncio.run(acc_handlers.account_number_quick_login(msg3))
+            mock_login3.assert_awaited_once_with(msg3, 3)
 
 
 if __name__ == "__main__":

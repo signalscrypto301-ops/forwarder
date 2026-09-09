@@ -15,7 +15,13 @@ def get_bot_module():
     active = _active_bot_var.get()
     if active is not None:
         return active
-    return sys.modules.get("bot") or sys.modules.get("Telegram.bot")
+    mod = sys.modules.get("bot") or sys.modules.get("Telegram.bot")
+    if mod is not None:
+        return mod
+    main_mod = sys.modules.get("__main__")
+    if main_mod and (hasattr(main_mod, "account_pool") or hasattr(main_mod, "dp")):
+        return main_mod
+    return None
 
 
 def bind_active_bot(fn, module):

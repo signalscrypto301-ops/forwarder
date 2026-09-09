@@ -1,5 +1,7 @@
 import os
 import sys
+# Register current module as 'bot' so submodules/handlers can always resolve it
+sys.modules["bot"] = sys.modules[__name__]
 import inspect
 import asyncio
 import time

@@ -62,18 +62,35 @@ def build_accounts_keyboard() -> InlineKeyboardMarkup:
     return keyboard
 
 
+def _get_pool():
+    bot_mod = _get_bot_module()
+    if bot_mod and hasattr(bot_mod, "account_pool") and bot_mod.account_pool:
+        return bot_mod.account_pool
+    try:
+        from account_pool import get_account_pool, default_account_pool
+        return get_account_pool() or default_account_pool
+    except Exception:
+        return None
+
+
 def build_account_select_keyboard(action_prefix: str) -> InlineKeyboardMarkup:
     IKM = _get_ikm()
     IKB = _get_ikb()
-    bot_mod = _get_bot_module()
-    pool = getattr(bot_mod, "account_pool", None)
+    pool = _get_pool()
     accounts = pool.get_all_accounts() if pool else []
+
+    # If pool is not ready or returned empty, fallback to 4 canonical accounts
+    if not accounts:
+        accounts = [
+            {"index": i, "is_ready": False, "status": "not_logged_in", "phone": None}
+            for i in (1, 2, 3, 4)
+        ]
 
     keyboard = IKM(row_width=2)
     btns = []
     for acc in accounts:
         idx = acc["index"]
-        status_icon = "🟢" if acc["is_ready"] else ("🟡" if acc["status"] == "waiting_qr_scan" else "⚪")
+        status_icon = "🟢" if acc.get("is_ready") else ("🟡" if acc.get("status") == "waiting_qr_scan" else "⚪")
         phone_hint = f" ({acc['phone'][-4:]})" if acc.get("phone") else ""
         btns.append(
             IKB(
@@ -92,13 +109,13 @@ async def _perform_login_for_account(message_or_call, account_index: int):
 
     send_reply = (
         message_or_call.reply
-        if isinstance(message_or_call, Message)
-        else message_or_call.message.reply
+        if hasattr(message_or_call, "reply")
+        else getattr(getattr(message_or_call, "message", None), "reply", None)
     )
     send_photo = (
         message_or_call.reply_photo
-        if isinstance(message_or_call, Message)
-        else message_or_call.message.reply_photo
+        if hasattr(message_or_call, "reply_photo")
+        else getattr(getattr(message_or_call, "message", None), "reply_photo", None)
     )
 
     bot_mod = _get_bot_module()
@@ -106,14 +123,37 @@ async def _perform_login_for_account(message_or_call, account_index: int):
     sync_fn = getattr(bot_mod, "_sync_account_pool_now", _sync_account_pool_now) if bot_mod else _sync_account_pool_now
     gen_qr_fn = getattr(bot_mod, "generate_qr_code", generate_qr_code) if bot_mod else generate_qr_code
 
+    # Provide immediate visual feedback that login QR generation has started
+    status_msg = None
     try:
-        status_code, res_data = await post_fn("createsession", data, timeout_sec=30)
+        status_msg = await send_reply(
+            f"⏳ <b>Generating WhatsApp Login QR for Account {account_index}...</b>\n"
+            f"Connecting to WhatsApp network, please wait...",
+            parse_mode=ParseMode.HTML,
+        )
+    except Exception:
+        pass
+
+    try:
+        status_code, res_data = await post_fn("createsession", data, timeout_sec=40)
         if status_code == 200:
             if res_data.get("ready"):
-                await send_reply(
-                    f"✅ <b>Account {account_index}</b> is already authorized and ready.",
-                    parse_mode=ParseMode.HTML,
-                )
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(
+                            f"✅ <b>Account {account_index}</b> is already authorized and ready.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                    except Exception:
+                        await send_reply(
+                            f"✅ <b>Account {account_index}</b> is already authorized and ready.",
+                            parse_mode=ParseMode.HTML,
+                        )
+                else:
+                    await send_reply(
+                        f"✅ <b>Account {account_index}</b> is already authorized and ready.",
+                        parse_mode=ParseMode.HTML,
+                    )
                 await sync_fn()
                 return
 
@@ -128,30 +168,97 @@ async def _perform_login_for_account(message_or_call, account_index: int):
                                 f"📱 <b>WhatsApp Login QR Code</b>\n"
                                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                                 f"Target Slot: <b>Account {account_index}</b>\n\n"
-                                f"Open WhatsApp on the device you want to link:\n"
+                                f"Open WhatsApp on Phone {account_index}:\n"
                                 f"<b>Settings ➔ Linked Devices ➔ Link a Device</b>\n\n"
-                                f"Once scanned, Account {account_index} will automatically join the active round-robin pool."
+                                f"Scan this QR code within 30 seconds to link Account {account_index}."
                             ),
                             parse_mode=ParseMode.HTML,
                         )
+                    if status_msg:
+                        try:
+                            await status_msg.delete()
+                        except Exception:
+                            pass
                 finally:
                     if os.path.exists(qr_path):
                         os.remove(qr_path)
                 await sync_fn()
             else:
-                await send_reply(f"ℹ️ Account {account_index}: {res_data.get('message')}")
+                msg_text = f"ℹ️ Account {account_index}: {res_data.get('message', 'No QR code returned')}"
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(msg_text)
+                    except Exception:
+                        await send_reply(msg_text)
+                else:
+                    await send_reply(msg_text)
         elif status_code == 202:
-            await send_reply(
-                f"⏳ Account {account_index} session is initializing in the background. Please wait a few moments and run <code>/login {account_index}</code> or <code>/accounts</code>.",
-                parse_mode=ParseMode.HTML,
-            )
+            # Poll once more after a brief pause
+            await asyncio.sleep(2.5)
+            c2, r2 = await post_fn("createsession", data, timeout_sec=20)
+            if c2 == 200 and r2.get("qrcode"):
+                qr_path = gen_qr_fn(r2["qrcode"])
+                try:
+                    with open(qr_path, "rb") as qr_fp:
+                        await send_photo(
+                            qr_fp,
+                            caption=(
+                                f"📱 <b>WhatsApp Login QR Code</b>\n"
+                                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                                f"Target Slot: <b>Account {account_index}</b>\n\n"
+                                f"Open WhatsApp on Phone {account_index}:\n"
+                                f"<b>Settings ➔ Linked Devices ➔ Link a Device</b>\n\n"
+                                f"Scan this QR code within 30 seconds to link Account {account_index}."
+                            ),
+                            parse_mode=ParseMode.HTML,
+                        )
+                    if status_msg:
+                        try:
+                            await status_msg.delete()
+                        except Exception:
+                            pass
+                finally:
+                    if os.path.exists(qr_path):
+                        os.remove(qr_path)
+                await sync_fn()
+                return
+
+            wait_msg = f"⏳ Account {account_index} session is initializing in the background. Tap <code>/login {account_index}</code> in a few seconds."
+            if status_msg:
+                try:
+                    await status_msg.edit_text(wait_msg, parse_mode=ParseMode.HTML)
+                except Exception:
+                    await send_reply(wait_msg, parse_mode=ParseMode.HTML)
+            else:
+                await send_reply(wait_msg, parse_mode=ParseMode.HTML)
         elif status_code == 400:
-            await send_reply(f"ℹ️ Account {account_index}: {res_data.get('message')}")
+            err_msg = f"ℹ️ Account {account_index}: {res_data.get('message', 'Bad request')}"
+            if status_msg:
+                try:
+                    await status_msg.edit_text(err_msg)
+                except Exception:
+                    await send_reply(err_msg)
+            else:
+                await send_reply(err_msg)
         else:
-            await send_reply(f"❌ Failed to create session for Account {account_index}.")
+            fail_msg = f"❌ Failed to create session for Account {account_index} (HTTP {status_code})."
+            if status_msg:
+                try:
+                    await status_msg.edit_text(fail_msg)
+                except Exception:
+                    await send_reply(fail_msg)
+            else:
+                await send_reply(fail_msg)
     except Exception as e:
         logger.error(f"Error in _perform_login_for_account({account_index}): {e}")
-        await send_reply(f"❌ Error contacting WhatsApp service for Account {account_index}: {e}")
+        err_out = f"❌ Error contacting WhatsApp service for Account {account_index}: {e}"
+        if status_msg:
+            try:
+                await status_msg.edit_text(err_out)
+            except Exception:
+                await send_reply(err_out)
+        else:
+            await send_reply(err_out)
 
 
 async def _perform_logout_for_account(message_or_call, account_index: int):
@@ -159,8 +266,8 @@ async def _perform_logout_for_account(message_or_call, account_index: int):
     data = {"clientId": target_id}
     send_reply = (
         message_or_call.reply
-        if isinstance(message_or_call, Message)
-        else message_or_call.message.reply
+        if hasattr(message_or_call, "reply")
+        else getattr(getattr(message_or_call, "message", None), "reply", None)
     )
 
     bot_mod = _get_bot_module()
@@ -380,16 +487,34 @@ async def login_whatsapp(message: Message):
         return
 
     bot_mod = _get_bot_module()
-    pool = getattr(bot_mod, "account_pool", None)
+    pool = _get_pool()
     login_fn = getattr(bot_mod, "_perform_login_for_account", _perform_login_for_account) if bot_mod else _perform_login_for_account
     sync_fn = getattr(bot_mod, "_sync_account_pool_now", _sync_account_pool_now) if bot_mod else _sync_account_pool_now
     kb_sel_fn = getattr(bot_mod, "build_account_select_keyboard", build_account_select_keyboard) if bot_mod else build_account_select_keyboard
 
-    args = message.get_args()
-    if args and args.strip() and pool:
-        account_id = pool.resolve_account_id(args.strip())
-        account_idx = pool.get_index_for_id(account_id)
-        await login_fn(message, account_idx)
+    # Support multiple formats: "/login 2", "/login2", "/login account2", "2"
+    args = message.get_args() if hasattr(message, "get_args") else ""
+    raw_text = (message.text or "").strip()
+
+    target_idx = None
+    if args and args.strip():
+        token = args.strip().split()[0]
+        if pool:
+            account_id = pool.resolve_account_id(token)
+            target_idx = pool.get_index_for_id(account_id)
+        else:
+            try:
+                target_idx = int(token)
+            except ValueError:
+                pass
+    elif raw_text:
+        import re
+        m = re.search(r"^/login\s*([1-4])\b", raw_text, re.IGNORECASE)
+        if m:
+            target_idx = int(m.group(1))
+
+    if target_idx in (1, 2, 3, 4):
+        await login_fn(message, target_idx)
     else:
         await sync_fn()
         kb = kb_sel_fn("cb:acc:login")
@@ -397,7 +522,7 @@ async def login_whatsapp(message: Message):
             "🔑 <b>Select WhatsApp Account to Log In:</b>\n"
             "━━━━━━━━━━━━━━━━━━━━━━\n"
             "You can run up to 4 parallel WhatsApp accounts simultaneously.\n"
-            "Choose an account slot below (or use <code>/login 1</code> to <code>/login 4</code>):",
+            "Tap an account button below (or use <code>/login 1</code> to <code>/login 4</code>):",
             reply_markup=kb,
             parse_mode=ParseMode.HTML,
         )
@@ -408,7 +533,7 @@ async def listen_whatsapp(message: Message):
         return
 
     bot_mod = _get_bot_module()
-    pool = getattr(bot_mod, "account_pool", None)
+    pool = _get_pool()
     args = message.get_args()
     client_id = pool.resolve_account_id(args.strip()) if (args and args.strip() and pool) else "user"
     data = {"clientId": client_id}
@@ -431,16 +556,33 @@ async def logout_whatsapp(message: Message):
         return
 
     bot_mod = _get_bot_module()
-    pool = getattr(bot_mod, "account_pool", None)
+    pool = _get_pool()
     logout_fn = getattr(bot_mod, "_perform_logout_for_account", _perform_logout_for_account) if bot_mod else _perform_logout_for_account
     sync_fn = getattr(bot_mod, "_sync_account_pool_now", _sync_account_pool_now) if bot_mod else _sync_account_pool_now
     kb_sel_fn = getattr(bot_mod, "build_account_select_keyboard", build_account_select_keyboard) if bot_mod else build_account_select_keyboard
 
-    args = message.get_args()
-    if args and args.strip() and pool:
-        account_id = pool.resolve_account_id(args.strip())
-        account_idx = pool.get_index_for_id(account_id)
-        await logout_fn(message, account_idx)
+    args = message.get_args() if hasattr(message, "get_args") else ""
+    raw_text = (message.text or "").strip()
+
+    target_idx = None
+    if args and args.strip():
+        token = args.strip().split()[0]
+        if pool:
+            account_id = pool.resolve_account_id(token)
+            target_idx = pool.get_index_for_id(account_id)
+        else:
+            try:
+                target_idx = int(token)
+            except ValueError:
+                pass
+    elif raw_text:
+        import re
+        m = re.search(r"^/logout\s*([1-4])\b", raw_text, re.IGNORECASE)
+        if m:
+            target_idx = int(m.group(1))
+
+    if target_idx in (1, 2, 3, 4):
+        await logout_fn(message, target_idx)
     else:
         await sync_fn()
         kb = kb_sel_fn("cb:acc:logout")
@@ -454,13 +596,29 @@ async def logout_whatsapp(message: Message):
         )
 
 
+async def account_number_quick_login(message: Message):
+    """If an admin sends just '1', '2', '3', or '4' in private chat, initiate login for that slot."""
+    if not message.chat.type == "private" or not _is_admin(message.from_user.id):
+        return
+    text = (message.text or "").strip()
+    if text in ("1", "2", "3", "4"):
+        idx = int(text)
+        bot_mod = _get_bot_module()
+        login_fn = getattr(bot_mod, "_perform_login_for_account", _perform_login_for_account) if bot_mod else _perform_login_for_account
+        await login_fn(message, idx)
+
+
 def register_accounts_handlers(dp):
     dp.register_message_handler(accounts_command, commands=["accounts", "sessions", "pool"])
     dp.register_message_handler(proxy_command, commands=["proxy", "proxies"])
-    dp.register_message_handler(login_whatsapp, commands=["login"])
-    dp.register_message_handler(logout_whatsapp, commands=["logout"])
+    dp.register_message_handler(login_whatsapp, commands=["login", "login1", "login2", "login3", "login4"])
+    dp.register_message_handler(logout_whatsapp, commands=["logout", "logout1", "logout2", "logout3", "logout4"])
     dp.register_message_handler(listen_whatsapp, commands=["listen"])
     dp.register_callback_query_handler(
         account_pool_callback_handler,
         lambda c: c.data and c.data.startswith("cb:acc:"),
+    )
+    dp.register_message_handler(
+        account_number_quick_login,
+        lambda m: m.text and m.text.strip() in ("1", "2", "3", "4"),
     )

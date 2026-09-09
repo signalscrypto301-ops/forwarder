@@ -275,3 +275,17 @@ class AccountPool:
         """Returns short summary e.g. '1/4 Active' or '4/4 Active'."""
         ready_count = len([a for a in CONFIGURED_ACCOUNTS if self._accounts[a]["is_ready"]])
         return f"{ready_count}/4 Accounts Active"
+
+
+default_account_pool = AccountPool()
+
+
+def get_account_pool() -> AccountPool:
+    try:
+        from bot_context import get_bot_module
+        bot_mod = get_bot_module()
+        if bot_mod and hasattr(bot_mod, "account_pool") and bot_mod.account_pool:
+            return bot_mod.account_pool
+    except Exception:
+        pass
+    return default_account_pool
