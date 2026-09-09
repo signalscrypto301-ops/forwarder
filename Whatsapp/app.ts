@@ -17,6 +17,7 @@ import multer from "multer";
 import path from "path";
 import mime from "mime-types";
 import sharp from "sharp";
+import { HttpsProxyAgent } from "https-proxy-agent";
 
 const app = express();
 const clientId: string = process.env.CLIENT_ID || "user";
@@ -52,6 +53,8 @@ interface SessionEntry {
     phoneNumber?: string;
     pushName?: string;
     connectedAt?: string;
+    hasProxy?: boolean;
+    proxyHost?: string;
 }
 
 const sessions: Record<string, SessionEntry> = {};
@@ -85,6 +88,36 @@ function formatJid(rawId: string): string {
         return `${clean}@g.us`;
     }
     return `${clean}@s.whatsapp.net`;
+}
+
+// ---------- Dedicated Proxy Resolution per Account Slot ----------
+function getAccountProxy(safeId: string): string | undefined {
+    let slotIndex: number | undefined;
+    if (safeId === "user" || safeId === "account1") slotIndex = 1;
+    else if (safeId === "account2") slotIndex = 2;
+    else if (safeId === "account3") slotIndex = 3;
+    else if (safeId === "account4") slotIndex = 4;
+
+    const upper = safeId.toUpperCase();
+    if (slotIndex && process.env[`ACCOUNT_${slotIndex}_PROXY`]) {
+        return process.env[`ACCOUNT_${slotIndex}_PROXY`];
+    }
+    if (process.env[`ACCOUNT_${upper}_PROXY`]) {
+        return process.env[`ACCOUNT_${upper}_PROXY`];
+    }
+    if (process.env[`PROXY_${upper}`]) {
+        return process.env[`PROXY_${upper}`];
+    }
+    return process.env.WHATSAPP_PROXY || process.env.GLOBAL_PROXY || undefined;
+}
+
+function maskProxyUrl(proxyUrl: string): string {
+    try {
+        const u = new URL(proxyUrl);
+        return `${u.protocol}//${u.host}`;
+    } catch (_) {
+        return proxyUrl.replace(/:[^:@]+@/, ":***@");
+    }
 }
 
 // ---------- Newsletter & MEX Support ----------
@@ -125,15 +158,21 @@ function loadKnownNewsletters() {
     }
 }
 
+let saveNewslettersTimer: NodeJS.Timeout | null = null;
+
 function saveKnownNewsletters() {
-    try {
-        const dir = path.dirname(KNOWN_NEWSLETTERS_FILE);
-        if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-        const list = Array.from(knownNewslettersMap.values());
-        fs.writeFileSync(KNOWN_NEWSLETTERS_FILE, JSON.stringify(list, null, 2), "utf-8");
-    } catch (e) {
-        console.warn("Error writing known_newsletters.json:", e);
-    }
+    if (saveNewslettersTimer) return;
+    saveNewslettersTimer = setTimeout(() => {
+        saveNewslettersTimer = null;
+        try {
+            const dir = path.dirname(KNOWN_NEWSLETTERS_FILE);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            const list = Array.from(knownNewslettersMap.values());
+            fs.writeFileSync(KNOWN_NEWSLETTERS_FILE, JSON.stringify(list, null, 2), "utf-8");
+        } catch (e) {
+            console.warn("Error writing known_newsletters.json:", e);
+        }
+    }, 4000);
 }
 
 function registerKnownNewsletter(id: string, name?: string, count?: number) {
@@ -298,12 +337,33 @@ async function createOrRestartSession(rawId: string): Promise<SessionEntry> {
 
     const socketFactory = (typeof makeWASocket === "function" ? makeWASocket : (makeWASocket as any).default) as typeof makeWASocket;
 
+    // Dedicated Proxy Support per Account Slot
+    let agent: any = undefined;
+    const proxyUrl = getAccountProxy(safeId);
+    if (proxyUrl) {
+        try {
+            agent = new HttpsProxyAgent(proxyUrl);
+            entry.hasProxy = true;
+            entry.proxyHost = maskProxyUrl(proxyUrl);
+            console.log(`[${safeId}] 🌐 Dedicated proxy active: ${entry.proxyHost}`);
+        } catch (proxyErr) {
+            console.error(`[${safeId}] ⚠️ Failed to initialize proxy for ${maskProxyUrl(proxyUrl)}:`, proxyErr);
+            entry.hasProxy = false;
+            entry.proxyHost = undefined;
+        }
+    } else {
+        entry.hasProxy = false;
+        entry.proxyHost = undefined;
+    }
+
     const sock = socketFactory({
         version,
         auth: {
             creds: state.creds,
             keys: makeCacheableSignalKeyStore(state.keys, logger),
         },
+        agent,
+        fetchAgent: agent,
         logger,
         printQRInTerminal: false,
         browser: Browsers.ubuntu("Chrome"),
@@ -416,6 +476,8 @@ app.get("/health", (req, res) => {
     res.status((ready || isLiveProbe) ? 200 : 503).json({
         status: ready ? "ready" : "initializing",
         clientId: safeId,
+        hasProxy: Boolean(entry?.hasProxy),
+        proxyHost: entry?.proxyHost || null,
         sessionsCount: Object.keys(sessions).length,
         timestamp: new Date().toISOString(),
         memory: {
@@ -464,6 +526,8 @@ app.get("/sessions", (req, res) => {
             connectedAt: entry?.connectedAt || null,
             hasAuthFolder,
             hasPendingQR: Boolean(entry?.currentQR),
+            hasProxy: Boolean(entry?.hasProxy),
+            proxyHost: entry?.proxyHost || null,
         };
     });
 
@@ -1096,7 +1160,40 @@ async function buildMediaPayload(filePath: string, originalName: string | undefi
     }
 }
 
-// Socket Transmission Queue to enforce minimum inter-frame spacing (350ms)
+// Helper function to simulate organic human typing/recording presence
+async function simulateTypingPresence(
+    targetId: string,
+    sock: WASocket,
+    jid: string,
+    options?: { isMedia?: boolean; textForDelay?: string }
+): Promise<void> {
+    // 1. Newsletters do not support presence updates
+    if (jid.endsWith("@newsletter")) return;
+    // 2. Can be explicitly disabled via env var if high speed needed
+    if (process.env.SIMULATE_TYPING === "false") return;
+
+    try {
+        const presence = options?.isMedia ? "recording" : "composing";
+        await sock.sendPresenceUpdate(presence, jid);
+
+        const textLen = (options?.textForDelay || "").length;
+        // Dynamic human delay:
+        // - Media: 1200ms - 2400ms
+        // - Text: scaled with character length (1000ms floor, ~14ms/char up to 3800ms ceiling) + organic jitter
+        const delayMs = options?.isMedia
+            ? 1200 + Math.floor(Math.random() * 1200)
+            : Math.min(Math.max(1000, textLen * 14), 3800) + Math.floor(Math.random() * 500);
+
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await sock.sendPresenceUpdate("paused", jid);
+    } catch (presenceErr) {
+        // Presence updates may fail if group permissions restrict it or during momentary reconnection.
+        // Never let presence update errors block message dispatch!
+        console.warn(`[${targetId}] ⚠️ Presence simulation notice for ${jid}:`, presenceErr);
+    }
+}
+
+// Socket Transmission Queue with organic inter-frame jitter (300ms - 750ms)
 const sessionQueues: Record<string, Promise<any>> = {};
 
 function enqueueSocketSend<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
@@ -1105,7 +1202,8 @@ function enqueueSocketSend<T>(sessionId: string, fn: () => Promise<T>): Promise<
         try {
             return await fn();
         } finally {
-            await new Promise((resolve) => setTimeout(resolve, 350));
+            const jitterDelay = 300 + Math.floor(Math.random() * 450);
+            await new Promise((resolve) => setTimeout(resolve, jitterDelay));
         }
     });
     sessionQueues[sessionId] = next.catch(() => {});
@@ -1130,10 +1228,15 @@ app.post("/sendToGroup", upload.single("media"), async (req, res) => {
                 return res.status(403).json({ message: "Video forwarding is banned" });
             }
             const payload = await buildMediaPayload(file.path, file.originalname, caption);
-            await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
+            await enqueueSocketSend(targetId, async () => {
+                await simulateTypingPresence(targetId, entry.sock!, jid, { isMedia: true, textForDelay: caption });
+                return await entry.sock!.sendMessage(jid, payload);
+            });
         } else if (caption) {
-
-            await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, { text: String(caption) }));
+            await enqueueSocketSend(targetId, async () => {
+                await simulateTypingPresence(targetId, entry.sock!, jid, { textForDelay: String(caption) });
+                return await entry.sock!.sendMessage(jid, { text: String(caption) });
+            });
         } else {
             return res.status(400).json({ message: "No media or caption provided" });
         }
@@ -1173,7 +1276,10 @@ app.post("/sendText", async (req, res) => {
 
     try {
         const jid = formatJid(groupId);
-        await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, { text: String(text) }));
+        await enqueueSocketSend(targetId, async () => {
+            await simulateTypingPresence(targetId, entry.sock!, jid, { textForDelay: String(text) });
+            return await entry.sock!.sendMessage(jid, { text: String(text) });
+        });
         if (jid.endsWith("@newsletter")) {
             registerKnownNewsletter(jid);
         }
@@ -1210,7 +1316,10 @@ app.post("/sendMedia", upload.single("media"), async (req, res) => {
         const jid = formatJid(groupId);
 
         const payload = await buildMediaPayload(file.path, file.originalname, caption);
-        await enqueueSocketSend(targetId, () => entry.sock!.sendMessage(jid, payload));
+        await enqueueSocketSend(targetId, async () => {
+            await simulateTypingPresence(targetId, entry.sock!, jid, { isMedia: true, textForDelay: caption });
+            return await entry.sock!.sendMessage(jid, payload);
+        });
 
         if (jid.endsWith("@newsletter")) {
             registerKnownNewsletter(jid);

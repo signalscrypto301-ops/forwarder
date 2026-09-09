@@ -36,10 +36,13 @@ class TokenBucket:
                 return 0.0
 
             wait_time = (1.0 - self.tokens) / self.refill_rate
-            await asyncio.sleep(wait_time)
+            # Apply organic micro-jitter (0.92 to 1.15) so token wait times avoid machine periodicity
+            jitter = random.uniform(0.92, 1.15)
+            actual_wait = wait_time * jitter
+            await asyncio.sleep(actual_wait)
             self.tokens = 0.0
             self.last_update = time.monotonic()
-            return wait_time
+            return actual_wait
 
 
 class DeliveryRateController:
@@ -173,10 +176,11 @@ class DeliveryRateController:
             # Approaching warning threshold: moderate pacing stretch
             base_delay *= 1.5
 
-        # Gaussian jitter with standard deviation = 15%
-        jitter = random.gauss(1.0, 0.15)
+        # Bounded Gaussian jitter strictly within [0.85, 1.35] with stddev = 15%
+        raw_jitter = random.gauss(1.0, 0.15)
+        bounded_jitter = max(0.85, min(1.35, raw_jitter))
         # Ensure delay never drops below safe absolute floor of 0.6 seconds
-        final_delay = max(0.6, base_delay * jitter)
+        final_delay = max(0.6, base_delay * bounded_jitter)
         return round(final_delay, 3)
 
     def record_sent(self, account_id: str = "user"):

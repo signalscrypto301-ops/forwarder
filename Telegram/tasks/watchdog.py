@@ -422,6 +422,10 @@ async def cmd_watchdog(message: Message):
                 badge = "⚪ <b>Not Logged In</b>"
 
             extra_info = []
+            if acc.get("hasProxy"):
+                proxy_host = acc.get("proxyHost") or "Active"
+                extra_info.append(f"🌐 Proxy: {proxy_host}")
+
             if outage_start and failures > 0:
                 outage_secs = int(time.time() - outage_start)
                 outage_str = f"{outage_secs // 60}m {outage_secs % 60}s" if outage_secs >= 60 else f"{outage_secs}s"
