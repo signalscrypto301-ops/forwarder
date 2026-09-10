@@ -100,8 +100,16 @@ def create_table():
     except sqlite3.OperationalError:
         pass
 
+    try:
+        cursor.execute("ALTER TABLE channels ADD COLUMN title TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     # Baseline existing channels: set last_post_at to CURRENT_TIMESTAMP if NULL
     cursor.execute("UPDATE channels SET last_post_at = CURRENT_TIMESTAMP WHERE last_post_at IS NULL")
+
+    # Clean any accidental mock titles or malformed values from channels table
+    cursor.execute("UPDATE channels SET title = NULL WHERE title LIKE '<AsyncMock%' OR title LIKE '<MagicMock%'")
 
     # Table for daily delivery metrics (Optimization 4.B)
     cursor.execute(
@@ -246,17 +254,134 @@ def create_table():
     connection.close()
 
 
-def add_channel(channel_id):
+def add_channel(channel_id, title=None):
     channel_id = clean_id(channel_id)
     if not channel_id:
         return
     connection = get_connection()
     cursor = connection.cursor()
-    cursor.execute(
-        "INSERT OR IGNORE INTO channels (channel_id, last_post_at) VALUES (?, CURRENT_TIMESTAMP)", (channel_id,)
-    )
+    if title and str(title).strip():
+        cursor.execute(
+            "INSERT INTO channels (channel_id, last_post_at, title) VALUES (?, CURRENT_TIMESTAMP, ?) "
+            "ON CONFLICT(channel_id) DO UPDATE SET title = COALESCE(excluded.title, channels.title)",
+            (channel_id, str(title).strip()),
+        )
+    else:
+        cursor.execute(
+            "INSERT OR IGNORE INTO channels (channel_id, last_post_at) VALUES (?, CURRENT_TIMESTAMP)", (channel_id,)
+        )
     connection.commit()
     connection.close()
+
+
+def update_channel_title(channel_id, title):
+    channel_id = clean_id(channel_id)
+    if not channel_id:
+        return
+    clean_title = str(title).strip() if title else None
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute("INSERT OR IGNORE INTO channels (channel_id) VALUES (?)", (channel_id,))
+    cursor.execute("UPDATE channels SET title = ? WHERE channel_id = ?", (clean_title, channel_id))
+    connection.commit()
+    connection.close()
+
+
+def get_channel_title(channel_id) -> str | None:
+    channel_id = clean_id(channel_id)
+    if not channel_id:
+        return None
+    connection = get_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute("SELECT title FROM channels WHERE channel_id = ?", (channel_id,))
+        row = cursor.fetchone()
+        if not row or not row[0]:
+            return None
+        val = str(row[0]).strip()
+        if val.startswith("<AsyncMock") or val.startswith("<MagicMock"):
+            return None
+        return val if val else None
+    except Exception:
+        return None
+    finally:
+        connection.close()
+
+
+def get_channels_without_title() -> list[str]:
+    """Returns list of monitored Telegram channel IDs that do not currently have a resolved title in DB."""
+    connection = get_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT channel_id FROM channels
+            WHERE title IS NULL OR TRIM(title) = '' OR title LIKE '<AsyncMock%' OR title LIKE '<MagicMock%'
+            UNION
+            SELECT DISTINCT cg.channel_id FROM channel_groups cg
+            LEFT JOIN channels c ON cg.channel_id = c.channel_id
+            WHERE c.title IS NULL OR TRIM(c.title) = '' OR c.title LIKE '<AsyncMock%' OR c.title LIKE '<MagicMock%'
+            """
+        )
+        rows = cursor.fetchall()
+        return [clean_id(r[0]) for r in rows if clean_id(r[0])]
+    except Exception:
+        return []
+    finally:
+        connection.close()
+
+
+def get_channels_for_group(group_id: str) -> list[str]:
+    group_id = clean_destination_id(group_id)
+    if not group_id:
+        return []
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        SELECT DISTINCT channel_id FROM channel_groups 
+        WHERE group_id = ? 
+           OR group_id = ? 
+           OR REPLACE(REPLACE(group_id, '<', ''), '>', '') = ?
+        ORDER BY channel_id ASC
+        """,
+        (group_id, f"<{group_id}>", group_id),
+    )
+    rows = cursor.fetchall()
+    connection.close()
+    return [clean_id(r[0]) for r in rows if clean_id(r[0])]
+
+
+def get_destination_names_map() -> dict[str, str]:
+    connection = get_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            """
+            SELECT cg.group_id, c.title, c.channel_id
+            FROM channel_groups cg
+            LEFT JOIN channels c ON cg.channel_id = c.channel_id
+            WHERE cg.group_id IS NOT NULL AND TRIM(cg.group_id) != ''
+            """
+        )
+        rows = cursor.fetchall()
+    except Exception:
+        rows = []
+    finally:
+        connection.close()
+
+    result = {}
+    for gid, title, cid in rows:
+        clean_gid = clean_destination_id(gid)
+        if clean_gid:
+            t = str(title).strip() if title and str(title).strip() else None
+            val = t or (clean_id(cid) if cid else None)
+            if val:
+                if clean_gid not in result:
+                    result[clean_gid] = val
+                if f"<{clean_gid}>" not in result:
+                    result[f"<{clean_gid}>"] = val
+    return result
 
 
 def add_group_for_channel(channel_id, group_id):
@@ -311,7 +436,8 @@ def get_channels_overview() -> list[dict]:
         SELECT 
             ch.channel_id,
             COALESCE(c.is_paused, 0) AS is_paused,
-            COUNT(DISTINCT g.group_id) AS group_count
+            COUNT(DISTINCT g.group_id) AS group_count,
+            c.title
         FROM (
             SELECT channel_id FROM channels
             UNION
@@ -334,6 +460,7 @@ def get_channels_overview() -> list[dict]:
                 "channel_id": cid,
                 "is_paused": bool(r[1] == 1),
                 "group_count": int(r[2]),
+                "title": str(r[3]).strip() if r[3] and str(r[3]).strip() else None,
             })
     return result
 
@@ -473,8 +600,10 @@ def get_channel_details(channel_id: str) -> dict:
     paused = is_channel_paused(channel_id)
     groups = get_groups_for_channel(channel_id)
     last_post = get_channel_last_post(channel_id)
+    title = get_channel_title(channel_id)
     return {
         "channel_id": channel_id,
+        "title": title,
         "is_paused": paused,
         "groups": groups,
         "last_post_at": last_post,

@@ -902,39 +902,114 @@ def format_admin_audit_report(data: dict) -> tuple[str, bool]:
         "<i>Forwarding messages from these accounts will fail until promoted!</i>\n\n"
     )
 
-    issue_lines = []
-    for idx, issue in enumerate(issues, 1):
+    # Group issues by destination ID preserving encounter order
+    dest_groups: dict[str, list[dict]] = {}
+    for issue in issues:
         raw_dest_id = str(issue.get("destinationId", "Unknown")).strip("<> ")
-        raw_dest_name = str(issue.get("destinationName") or raw_dest_id).strip("<> ")
-        dest_type = str(issue.get("destinationType", "channel")).upper()
-        acc = issue.get("account", {})
-        raw_phone = str(acc.get("phone") or "No Phone (Not Logged In)")
-        raw_label = str(acc.get("label") or f"Account {acc.get('index', '?')}")
-        raw_role = str(acc.get("role", "NOT ADMIN")).upper()
+        dest_groups.setdefault(raw_dest_id, []).append(issue)
 
-        err_str = str(acc.get("error", "")).strip()
-        raw_err = f" ({err_str})" if err_str and "session is not" not in err_str.lower() else ""
+    issue_lines = []
+    for idx, (raw_dest_id, group_issues) in enumerate(dest_groups.items(), 1):
+        first_issue = group_issues[0]
+        raw_dest_name = str(first_issue.get("destinationName") or "").strip("<> ")
+        dest_type = str(first_issue.get("destinationType", "channel")).upper()
+
+        # Check if raw_dest_name is genuine (not equal to ID and not a JID string)
+        is_genuine = (
+            bool(raw_dest_name)
+            and raw_dest_name.lower() != raw_dest_id.lower()
+            and not raw_dest_name.endswith("@newsletter")
+            and not raw_dest_name.endswith("@g.us")
+            and not raw_dest_name.isdigit()
+        )
+
+        # Fallback 1: check resolve_group_name from WhatsApp cache
+        if not is_genuine:
+            try:
+                from services.whatsapp import resolve_group_name
+                cached_name = resolve_group_name(raw_dest_id)
+                if (
+                    cached_name
+                    and cached_name.lower() != raw_dest_id.lower()
+                    and not cached_name.endswith("@newsletter")
+                    and not cached_name.endswith("@g.us")
+                ):
+                    raw_dest_name = cached_name
+                    is_genuine = True
+            except Exception:
+                pass
+
+        # Fallback 2: check mapped Telegram channels from database
+        tg_channel_names = []
+        mapped_ch_ids = []
+        try:
+            from database import get_channels_for_group, get_channel_title
+            mapped_ch_ids = get_channels_for_group(raw_dest_id)
+            for ch_id in mapped_ch_ids:
+                ch_title = get_channel_title(ch_id)
+                if ch_title:
+                    tg_channel_names.append(f"{html.escape(ch_title)} (<code>{html.escape(ch_id)}</code>)")
+                else:
+                    tg_channel_names.append(f"<code>{html.escape(ch_id)}</code>")
+        except Exception:
+            mapped_ch_ids = []
+
+        # If still not genuine name, use Telegram channel title if available
+        if not is_genuine and mapped_ch_ids:
+            try:
+                from database import get_channel_title
+                first_title = get_channel_title(mapped_ch_ids[0])
+                if first_title:
+                    raw_dest_name = first_title
+                    is_genuine = True
+            except Exception:
+                pass
+
+        if not raw_dest_name:
+            raw_dest_name = raw_dest_id
 
         # Escape ALL fields for Telegram HTML parse mode to prevent any entity parse crashes
         dest_id = html.escape(raw_dest_id)
         dest_name = html.escape(raw_dest_name)
-        phone = html.escape(raw_phone)
-        label = html.escape(raw_label)
-        role = html.escape(raw_role)
-        err_detail = f" <i>{html.escape(raw_err)}</i>" if raw_err else ""
-
         type_emoji = "📢" if dest_type == "NEWSLETTER" else "👥"
-        card = (
-            f"❌ <b>#{idx} {type_emoji} {dest_name}</b>\n"
-            f"   └ 🆔 <b>ID:</b> <code>{dest_id}</code>\n"
-            f"   └ 📱 <b>Mobile:</b> <code>{phone}</code> ({label})\n"
-            f"   └ ⚠️ <b>Status:</b> <b>{role}</b>{err_detail}\n"
-        )
+
+        card_lines = [
+            f"❌ <b>#{idx} {type_emoji} {dest_name}</b>",
+            f"   └ 🆔 <b>ID:</b> <code>{dest_id}</code>",
+        ]
+        if tg_channel_names:
+            card_lines.append(f"   └ 📡 <b>Forwarded From:</b> {', '.join(tg_channel_names)}")
+
+        if len(group_issues) == 1:
+            acc = group_issues[0].get("account", {})
+            phone = html.escape(str(acc.get("phone") or "No Phone (Not Logged In)"))
+            label = html.escape(str(acc.get("label") or f"Account {acc.get('index', '?')}"))
+            role = html.escape(str(acc.get("role", "NOT ADMIN")).upper())
+            err_str = str(acc.get("error", "")).strip()
+            raw_err = f" ({err_str})" if err_str and "session is not" not in err_str.lower() else ""
+            err_detail = f" <i>{html.escape(raw_err)}</i>" if raw_err else ""
+            card_lines.extend([
+                f"   └ 📱 <b>Mobile:</b> <code>{phone}</code> ({label})",
+                f"   └ ⚠️ <b>Status:</b> <b>{role}</b>{err_detail}",
+            ])
+        else:
+            card_lines.append(f"   └ ⚠️ <b>Accounts Requiring Admin ({len(group_issues)}):</b>")
+            for iss in group_issues:
+                acc = iss.get("account", {})
+                phone = html.escape(str(acc.get("phone") or "No Phone (Not Logged In)"))
+                label = html.escape(str(acc.get("label") or f"Account {acc.get('index', '?')}"))
+                role = html.escape(str(acc.get("role", "NOT ADMIN")).upper())
+                err_str = str(acc.get("error", "")).strip()
+                raw_err = f" ({err_str})" if err_str and "session is not" not in err_str.lower() else ""
+                err_detail = f" <i>{html.escape(raw_err)}</i>" if raw_err else ""
+                card_lines.append(f"      • 📱 <code>{phone}</code> ({label}) ➔ <b>{role}</b>{err_detail}")
+
+        card = "\n".join(card_lines) + "\n"
         issue_lines.append(card)
 
     footer = (
         "\n━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 <b>Summary:</b> <code>{len(issues)} issue(s)</code> across <code>{total_destinations} destinations</code>.\n\n"
+        f"📊 <b>Summary:</b> <code>{len(issues)} issue(s)</code> across <code>{len(dest_groups)} destination(s)</code> (audited {total_destinations} total destinations).\n\n"
         "👉 <b>Action Required:</b>\n"
         "1. Open WhatsApp.\n"
         "2. Open the respective Channel or Group settings.\n"
@@ -944,10 +1019,30 @@ def format_admin_audit_report(data: dict) -> tuple[str, bool]:
     full_text = header + "\n".join(issue_lines) + footer
     if len(full_text) > 4000:
         truncated_lines = issue_lines[:15]
-        footer_trunc = f"\n<i>...and {len(issue_lines) - 15} more issues.</i>\n" + footer
+        footer_trunc = f"\n<i>...and {len(issue_lines) - 15} more channels with issues.</i>\n" + footer
         full_text = header + "\n".join(truncated_lines) + footer_trunc
 
     return full_text, False
+
+
+async def _resolve_missing_channel_titles(bot_instance):
+    if not bot_instance:
+        return
+    try:
+        from database import get_channels_without_title, update_channel_title
+        missing = await asyncio.to_thread(get_channels_without_title)
+        for ch in missing:
+            try:
+                chat = await bot_instance.get_chat(ch)
+                if chat and getattr(chat, "title", None):
+                    t = str(chat.title).strip()
+                    if t and not t.startswith("<AsyncMock") and not t.startswith("<MagicMock"):
+                        await asyncio.to_thread(update_channel_title, ch, t)
+                await asyncio.sleep(0.05)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.debug(f"Pre-audit title check notice: {e}")
 
 
 async def audit_admins_command(message: Message):
@@ -961,6 +1056,9 @@ async def audit_admins_command(message: Message):
         "<i>Inspecting all connected WhatsApp accounts against forwarded channels & groups...</i>",
         parse_mode=ParseMode.HTML,
     )
+
+    bot_instance = getattr(bot_mod, "bot", None) or getattr(message, "bot", None)
+    await _resolve_missing_channel_titles(bot_instance)
 
     audit_fn = getattr(bot_mod, "audit_channel_admins", audit_channel_admins) if bot_mod else audit_channel_admins
 
@@ -1015,6 +1113,9 @@ async def handle_audit_admins_callback(call: CallbackQuery):
         return
 
     await call.answer("🔍 Auditing permissions...", show_alert=False)
+    bot_instance = getattr(bot_mod, "bot", None) or getattr(call, "bot", None)
+    await _resolve_missing_channel_titles(bot_instance)
+
     audit_fn = getattr(bot_mod, "audit_channel_admins", audit_channel_admins) if bot_mod else audit_channel_admins
 
     try:

@@ -33,6 +33,7 @@ from database import (
     record_delivery_metric,
     add_failed_message,
     update_channel_last_post,
+    update_channel_title,
     record_channel_post_activity,
     record_forwarded_message,
     get_forwarded_messages,
@@ -963,6 +964,10 @@ async def handle_channel_post(message: types.Message):
 
     # Record channel activity timestamp
     await asyncio.to_thread(update_channel_last_post, channel_id)
+
+    # Record channel title if available from message chat
+    if getattr(message, "chat", None) and getattr(message.chat, "title", None):
+        await asyncio.to_thread(update_channel_title, channel_id, message.chat.title)
 
     # Record channel hourly post volume
     await asyncio.to_thread(record_channel_post_activity, channel_id)

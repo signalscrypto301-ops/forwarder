@@ -1,4 +1,5 @@
 import sys
+import html
 import asyncio
 from aiogram.types import (
     Message,
@@ -176,8 +177,29 @@ async def view_groups_command(message: Message):
     reply = "<b>Channels and WhatsApp Mappings:</b>\n\n"
     for ch in channels:
         groups = await asyncio.to_thread(get_groups_for_channel, ch)
-        group_list = ", ".join(f"<code>{g}</code>" for g in groups) if groups else "<i>None</i>"
-        reply += f"📢 Channel: <code>{ch}</code>\n🔗 Groups: {group_list}\n\n"
+        dest_items = []
+        for g in (groups or []):
+            try:
+                from services.whatsapp import resolve_group_name
+                rname = resolve_group_name(g)
+            except Exception:
+                rname = g
+            if rname and rname != g and not rname.endswith("@newsletter") and not rname.endswith("@g.us"):
+                dest_items.append(f"{html.escape(rname)} (<code>{html.escape(g)}</code>)")
+            else:
+                dest_items.append(f"<code>{html.escape(g)}</code>")
+
+        group_list = ", ".join(dest_items) if dest_items else "<i>None</i>"
+        try:
+            from database import get_channel_title
+            ch_title = await asyncio.to_thread(get_channel_title, ch)
+        except Exception:
+            ch_title = None
+
+        if ch_title:
+            reply += f"📢 <b>{html.escape(ch_title)}</b> (<code>{html.escape(ch)}</code>)\n🔗 Destinations: {group_list}\n\n"
+        else:
+            reply += f"📢 Channel: <code>{html.escape(ch)}</code>\n🔗 Destinations: {group_list}\n\n"
 
     if len(reply) > 4000:
         chunks = [reply[i : i + 4000] for i in range(0, len(reply), 4000)]

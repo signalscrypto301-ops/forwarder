@@ -1,5 +1,6 @@
 import sys
 import asyncio
+import html
 from aiogram.types import (
     Message,
     CallbackQuery,
@@ -96,9 +97,11 @@ def build_channels_keyboard(page: int = 1, per_page: int = 6) -> tuple[str, Inli
         ch = item["channel_id"]
         paused = item["is_paused"]
         group_count = item["group_count"]
+        title = item.get("title")
         status_icon = "⏸️" if paused else "🟢"
         state_str = "Paused" if paused else f"{group_count} grp{'s' if group_count != 1 else ''}"
-        btn_text = f"{status_icon} {ch} ({state_str})"
+        display_name = title if title else ch
+        btn_text = f"{status_icon} {display_name} ({state_str})"
         keyboard.add(IKB(text=btn_text, callback_data=f"cb:view:{ch}:{page}"))
 
     # Navigation row
@@ -152,16 +155,28 @@ def build_channel_detail_keyboard(channel_id: str, page: int = 1) -> tuple[str, 
     toggle_btn_text = "▶️ Activate Channel (Resume Forwarding)" if paused else "⏸️ Deactivate Channel (Pause Forwarding)"
     toggle_action = "unpause" if paused else "pause"
 
+    title = details.get("title")
+    title_str = f" <b>{html.escape(title)}</b>" if title else ""
+
     groups_text = ""
     if groups:
         for idx, g in enumerate(groups, 1):
             kind = "📢 Newsletter" if "@newsletter" in g else "👥 Group"
-            groups_text += f"\n  <code>{idx}.</code> <b>{kind}:</b> <code>{g}</code>"
+            try:
+                from services.whatsapp import resolve_group_name
+                rname = resolve_group_name(g)
+            except Exception:
+                rname = g
+            if rname and rname != g and not rname.endswith("@newsletter") and not rname.endswith("@g.us"):
+                g_display = f"<b>{html.escape(rname)}</b> (<code>{html.escape(g)}</code>)"
+            else:
+                g_display = f"<code>{html.escape(g)}</code>"
+            groups_text += f"\n  <code>{idx}.</code> <b>{kind}:</b> {g_display}"
     else:
         groups_text = "\n  <i>No WhatsApp groups mapped yet. Tap '➕ Map WhatsApp Destination' below!</i>"
 
     text = (
-        f"📢 <b>Channel:</b> <code>{channel_id}</code>\n"
+        f"📢 <b>Channel:</b>{title_str} (<code>{html.escape(channel_id)}</code>)\n"
         "━━━━━━━━━━━━━━━━━━━━━━\n"
         f"• <b>Status:</b> <b>{status_badge}</b>\n"
         f"• <b>Last Activity:</b> <code>{last_post}</code>\n"
@@ -449,9 +464,18 @@ async def add_channel_command(message: Message):
         return
 
     channel_id = args.strip()
-    await asyncio.to_thread(add_channel, channel_id)
+    title = None
+    if getattr(message, "bot", None):
+        try:
+            chat = await message.bot.get_chat(clean_id(channel_id))
+            if chat and getattr(chat, "title", None):
+                title = chat.title
+        except Exception:
+            pass
+    await asyncio.to_thread(add_channel, channel_id, title)
+    title_str = f" (<b>{html.escape(title)}</b>)" if title else ""
     await message.reply(
-        f"✅ Channel <code>{clean_id(channel_id)}</code> registered successfully.",
+        f"✅ Channel <code>{clean_id(channel_id)}</code>{title_str} registered successfully.",
         parse_mode=ParseMode.HTML,
     )
 

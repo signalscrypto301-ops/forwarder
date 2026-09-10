@@ -359,6 +359,213 @@ class TestAdminAudit(unittest.IsolatedAsyncioTestCase):
         finally:
             self._set_audit_mock(bot.audit_channel_admins)
 
+    def test_database_channel_title_and_destination_names_map(self):
+        """Verify database functions for channel titles and destination mapping."""
+        cid = "-100999888777"
+        gid = "120363999999999999@newsletter"
+        database.add_channel(cid, title="Crypto Alpha TG")
+        self.assertEqual(database.get_channel_title(cid), "Crypto Alpha TG")
+
+        database.add_group_for_channel(cid, gid)
+        mapped_channels = database.get_channels_for_group(gid)
+        self.assertIn(cid, mapped_channels)
+
+        dest_map = database.get_destination_names_map()
+        self.assertIn(gid, dest_map)
+        self.assertEqual(dest_map[gid], "Crypto Alpha TG")
+
+        database.update_channel_title(cid, "Crypto Alpha TG Updated")
+        self.assertEqual(database.get_channel_title(cid), "Crypto Alpha TG Updated")
+
+    def test_format_admin_audit_report_resolves_telegram_channel_title_when_dest_name_is_jid(self):
+        """When destinationName is equal to raw JID, format_admin_audit_report resolves Telegram channel title."""
+        cid = "-1002712544343"
+        gid = "120363400968035394@newsletter"
+        database.add_channel(cid, title="BTC FX GURU")
+        database.add_group_for_channel(cid, gid)
+
+        data = {
+            "allCompliant": False,
+            "totalDestinations": 1,
+            "totalConfiguredAccounts": 4,
+            "totalReadyAccounts": 1,
+            "issuesCount": 1,
+            "issues": [
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,  # Raw JID fallback from WA service
+                    "destinationType": "newsletter",
+                    "account": {
+                        "clientId": "user",
+                        "index": 1,
+                        "label": "Account 1",
+                        "phone": "+12262406756",
+                        "role": "SUBSCRIBER",
+                        "error": None,
+                    },
+                }
+            ],
+        }
+
+        text, compliant = admin.format_admin_audit_report(data)
+        self.assertFalse(compliant)
+        # Should display BTC FX GURU as the channel header name instead of raw JID
+        self.assertIn("BTC FX GURU", text)
+        self.assertIn(f"ID:</b> <code>{gid}</code>", text)
+        self.assertIn("Forwarded From:", text)
+        self.assertIn("-1002712544343", text)
+
+    def test_format_admin_audit_report_displays_both_whatsapp_and_telegram_channel(self):
+        """When WhatsApp channel name and Telegram channel source are both available, display both."""
+        cid = "-1001122334455"
+        gid = "120363112233445566@newsletter"
+        database.add_channel(cid, title="Forex Master Telegram")
+        database.add_group_for_channel(cid, gid)
+
+        data = {
+            "allCompliant": False,
+            "totalDestinations": 1,
+            "totalConfiguredAccounts": 4,
+            "totalReadyAccounts": 1,
+            "issuesCount": 1,
+            "issues": [
+                {
+                    "destinationId": gid,
+                    "destinationName": "WhatsApp VIP Signals",
+                    "destinationType": "newsletter",
+                    "account": {
+                        "clientId": "user",
+                        "index": 1,
+                        "label": "Account 1",
+                        "phone": "+12262406756",
+                        "role": "SUBSCRIBER",
+                        "error": None,
+                    },
+                }
+            ],
+        }
+
+        text, compliant = admin.format_admin_audit_report(data)
+        self.assertFalse(compliant)
+        # Main header should show WhatsApp VIP Signals
+        self.assertIn("WhatsApp VIP Signals", text)
+        # Source line should show Forex Master Telegram
+        self.assertIn("Forwarded From:", text)
+        self.assertIn("Forex Master Telegram", text)
+
+    def test_format_admin_audit_report_groups_multiple_accounts_under_single_channel(self):
+        """When multiple accounts fail on the same channel, they are grouped under one card."""
+        cid = "-1002712544343"
+        gid = "120363400968035394@newsletter"
+        database.add_channel(cid, title="BTC FX GURU")
+        database.add_group_for_channel(cid, gid)
+
+        data = {
+            "allCompliant": False,
+            "totalDestinations": 1,
+            "totalConfiguredAccounts": 4,
+            "totalReadyAccounts": 4,
+            "issuesCount": 4,
+            "issues": [
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,
+                    "destinationType": "newsletter",
+                    "account": {"index": 1, "phone": "+12262406756", "label": "Account 1", "role": "SUBSCRIBER"},
+                },
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,
+                    "destinationType": "newsletter",
+                    "account": {"index": 2, "phone": "+66654306707", "label": "Account 2", "role": "NOT_IN_CHANNEL"},
+                },
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,
+                    "destinationType": "newsletter",
+                    "account": {"index": 3, "phone": "+639851862305", "label": "Account 3", "role": "NOT_IN_CHANNEL"},
+                },
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,
+                    "destinationType": "newsletter",
+                    "account": {"index": 4, "phone": "+8562054432093", "label": "Account 4", "role": "NOT_IN_CHANNEL"},
+                },
+            ],
+        }
+
+        text, compliant = admin.format_admin_audit_report(data)
+        self.assertFalse(compliant)
+        # Should have only ONE channel header #1
+        self.assertIn("#1", text)
+        self.assertNotIn("#2", text)
+        self.assertIn("BTC FX GURU", text)
+        self.assertIn("Accounts Requiring Admin (4)", text)
+        self.assertIn("+12262406756", text)
+        self.assertIn("+66654306707", text)
+        self.assertIn("+639851862305", text)
+        self.assertIn("+8562054432093", text)
+
+    async def test_watchdog_permission_alert_groups_by_channel_and_resolves_name(self):
+        """Watchdog admin check groups by channel and resolves channel title and Telegram source."""
+        from tasks import watchdog
+        mock_bot = AsyncMock()
+        mock_bot.send_message = AsyncMock()
+
+        cid = "-1002712544343"
+        gid = "120363400968035394@newsletter"
+        database.add_channel(cid, title="BTC FX GURU")
+        database.add_group_for_channel(cid, gid)
+
+        data = {
+            "allCompliant": False,
+            "issues": [
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,  # raw JID
+                    "destinationType": "newsletter",
+                    "account": {"index": 1, "phone": "+12262406756", "label": "Account 1", "role": "SUBSCRIBER"},
+                },
+                {
+                    "destinationId": gid,
+                    "destinationName": gid,  # raw JID
+                    "destinationType": "newsletter",
+                    "account": {"index": 2, "phone": "+66654306707", "label": "Account 2", "role": "NOT_IN_CHANNEL"},
+                },
+            ],
+        }
+        mock_audit = AsyncMock(return_value=(200, data))
+        self._set_audit_mock(mock_audit)
+        watchdog._last_admin_permission_alert_time = 0.0
+
+        try:
+            await watchdog.check_and_alert_admin_permissions(mock_bot)
+            mock_bot.send_message.assert_called()
+            call_args = mock_bot.send_message.call_args[0]
+            alert_msg = call_args[1]
+            # Channel name BTC FX GURU should be in the alert header
+            self.assertIn("BTC FX GURU", alert_msg)
+            self.assertIn(gid, alert_msg)
+            self.assertIn("+12262406756", alert_msg)
+            self.assertIn("+66654306707", alert_msg)
+            self.assertIn("SUBSCRIBER", alert_msg)
+            self.assertIn("NOT_IN_CHANNEL", alert_msg)
+            self.assertIn("Source:", alert_msg)
+        finally:
+            self._set_audit_mock(bot.audit_channel_admins)
+
+    def test_get_channels_without_title(self):
+        """get_channels_without_title returns channels that do not have a title."""
+        ch_with_title = "-100999000111"
+        ch_without_title = "-100999000222"
+        database.add_channel(ch_with_title, title="Has Title")
+        database.add_channel(ch_without_title)
+        database.update_channel_title(ch_without_title, "")
+
+        missing = database.get_channels_without_title()
+        self.assertIn(ch_without_title, missing)
+        self.assertNotIn(ch_with_title, missing)
+
 
 if __name__ == "__main__":
     unittest.main()

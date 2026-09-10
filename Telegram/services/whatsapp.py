@@ -17,7 +17,12 @@ from aiogram.types import ParseMode
 
 import config
 from logger import logger
-from database import get_all_channels, get_groups_for_channel, get_all_unique_destinations
+from database import (
+    get_all_channels,
+    get_groups_for_channel,
+    get_all_unique_destinations,
+    get_destination_names_map,
+)
 from account_pool import AccountPool
 
 http_session: aiohttp.ClientSession | None = None
@@ -370,6 +375,7 @@ async def audit_channel_admins(destinations: list[str] | None = None) -> tuple[i
     bot_mod = _get_bot_module()
     post_fn = getattr(bot_mod, "post_whatsapp_json", post_whatsapp_json) if bot_mod else post_whatsapp_json
     get_dests_fn = getattr(bot_mod, "get_all_unique_destinations", get_all_unique_destinations) if bot_mod else get_all_unique_destinations
+    get_names_fn = getattr(bot_mod, "get_destination_names_map", get_destination_names_map) if bot_mod else get_destination_names_map
 
     if destinations is None:
         try:
@@ -378,6 +384,31 @@ async def audit_channel_admins(destinations: list[str] | None = None) -> tuple[i
             logger.warning(f"Error fetching destinations from database: {e}")
             destinations = []
 
-    payload = {"destinations": destinations or []}
+    dest_names: dict[str, str] = {}
+    try:
+        dest_names = await asyncio.to_thread(get_names_fn)
+    except Exception as e:
+        logger.debug(f"Error building destination names map: {e}")
+
+    cache = getattr(bot_mod, "WHATSAPP_CHATS_CACHE", WHATSAPP_CHATS_CACHE) if bot_mod else WHATSAPP_CHATS_CACHE
+    if not cache.get("chats"):
+        try:
+            fetch_chats_fn = getattr(bot_mod, "fetch_whatsapp_chats", fetch_whatsapp_chats) if bot_mod else fetch_whatsapp_chats
+            chats = await fetch_chats_fn()
+            cache["chats"] = chats
+        except Exception as e:
+            logger.debug(f"Could not pre-fetch chats for audit: {e}")
+
+    for c in cache.get("chats") or []:
+        cid = c.get("id")
+        cname = c.get("name")
+        if cid and cname and cname != cid and not cname.endswith("@newsletter") and not cname.endswith("@g.us"):
+            dest_names[cid] = cname
+            dest_names[f"<{cid}>"] = cname
+
+    payload = {
+        "destinations": destinations or [],
+        "destinationNames": dest_names,
+    }
     return await post_fn("audit-admins", payload, timeout_sec=90)
 

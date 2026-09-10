@@ -409,6 +409,12 @@ async def check_and_alert_admin_permissions(bot_instance=None):
         from services.whatsapp import audit_channel_admins as audit_fn
 
     try:
+        try:
+            from handlers.admin import _resolve_missing_channel_titles
+            await _resolve_missing_channel_titles(b_inst)
+        except Exception:
+            pass
+
         status_code, data = await audit_fn()
         if status_code == 200 and not data.get("allCompliant", False):
             issues = data.get("issues", [])
@@ -418,23 +424,80 @@ async def check_and_alert_admin_permissions(bot_instance=None):
 
             _last_admin_permission_alert_time = now
 
+            # Group issues by destination ID
+            dest_map: dict[str, list[dict]] = {}
+            for iss in ready_issues:
+                did = str(iss.get("destinationId") or "").strip("<> ")
+                dest_map.setdefault(did, []).append(iss)
+
             alert_lines = [
                 "⚠️ <b>[Watchdog Alert] Missing Channel Admin Permissions!</b>\n",
                 "One or more connected WhatsApp accounts do not have Admin/Owner rights in forwarded channels:\n",
             ]
-            for idx, iss in enumerate(ready_issues[:8], 1):
-                raw_dest_name = str(iss.get("destinationName") or iss.get("destinationId") or "").strip("<> ")
+
+            shown_dests = list(dest_map.items())[:6]
+            for idx, (raw_dest_id, group_issues) in enumerate(shown_dests, 1):
+                first_iss = group_issues[0]
+                raw_dest_name = str(first_iss.get("destinationName") or "").strip("<> ")
+                is_genuine = (
+                    bool(raw_dest_name)
+                    and raw_dest_name.lower() != raw_dest_id.lower()
+                    and not raw_dest_name.endswith("@newsletter")
+                    and not raw_dest_name.endswith("@g.us")
+                    and not raw_dest_name.isdigit()
+                )
+                if not is_genuine and raw_dest_id:
+                    try:
+                        from services.whatsapp import resolve_group_name
+                        cname = resolve_group_name(raw_dest_id)
+                        if cname and cname.lower() != raw_dest_id.lower() and not cname.endswith("@newsletter") and not cname.endswith("@g.us"):
+                            raw_dest_name = cname
+                            is_genuine = True
+                    except Exception:
+                        pass
+
+                tg_source = ""
+                if raw_dest_id:
+                    try:
+                        from database import get_channels_for_group, get_channel_title
+                        mapped_ch_ids = get_channels_for_group(raw_dest_id)
+                        if mapped_ch_ids:
+                            ch_title = get_channel_title(mapped_ch_ids[0])
+                            if ch_title:
+                                tg_source = f"{ch_title} ({mapped_ch_ids[0]})"
+                                if not is_genuine:
+                                    raw_dest_name = ch_title
+                                    is_genuine = True
+                            else:
+                                tg_source = mapped_ch_ids[0]
+                    except Exception:
+                        pass
+
+                if not raw_dest_name:
+                    raw_dest_name = raw_dest_id
+
                 d_name = html.escape(raw_dest_name)
-                acc = iss.get("account", {})
-                phone = html.escape(str(acc.get("phone") or "No Phone"))
-                lbl = html.escape(str(acc.get("label") or f"Account {acc.get('index', '?')}"))
-                r = html.escape(str(acc.get("role", "NOT ADMIN")))
-                alert_lines.append(f"• <b>{d_name}</b>: <code>{phone}</code> ({lbl}) is <b>{r}</b>")
+                d_id = html.escape(raw_dest_id)
+                dest_type = str(first_iss.get("destinationType", "channel")).upper()
+                emoji = "📢" if dest_type == "NEWSLETTER" else "👥"
 
-            if len(ready_issues) > 8:
-                alert_lines.append(f"<i>...and {len(ready_issues) - 8} more channels.</i>")
+                alert_lines.append(f"<b>{emoji} #{idx} {d_name}</b>")
+                alert_lines.append(f"└ 🆔 <code>{d_id}</code>")
+                if tg_source:
+                    alert_lines.append(f"└ 📡 <b>Source:</b> {html.escape(tg_source)}")
 
-            alert_lines.append("\n👉 <i>Promote these mobile numbers to Admin in WhatsApp or use /audit_admins to inspect!</i>")
+                for iss in group_issues:
+                    acc = iss.get("account", {})
+                    phone = html.escape(str(acc.get("phone") or "No Phone"))
+                    lbl = html.escape(str(acc.get("label") or f"Account {acc.get('index', '?')}"))
+                    r = html.escape(str(acc.get("role", "NOT ADMIN")))
+                    alert_lines.append(f"   • <code>{phone}</code> ({lbl}) ➔ <b>{r}</b>")
+                alert_lines.append("")
+
+            if len(dest_map) > 6:
+                alert_lines.append(f"<i>...and {len(dest_map) - 6} more channels with permission issues.</i>\n")
+
+            alert_lines.append("👉 <i>Promote these mobile numbers to Admin in WhatsApp or use /audit_admins to inspect!</i>")
             msg_text = "\n".join(alert_lines)
 
             for admin_id in config.admin_ids:

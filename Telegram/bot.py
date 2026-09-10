@@ -177,6 +177,7 @@ from handlers.admin import (
     audit_admins_command,
     format_admin_audit_report,
     handle_audit_admins_callback,
+    _resolve_missing_channel_titles,
     build_analytics_keyboard,
     build_analytics_detail_keyboard,
     analytics_command,
@@ -282,6 +283,7 @@ async def on_startup(_):
     asyncio.create_task(scheduled_auto_healer_loop())
     asyncio.create_task(scheduled_account_pool_sync_loop())
     asyncio.create_task(sync_database_newsletters_to_whatsapp())
+    asyncio.create_task(_resolve_missing_channel_titles(bot))
     print("Bot is up and operational.")
 
 

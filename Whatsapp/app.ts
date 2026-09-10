@@ -327,6 +327,26 @@ function saveKnownNewsletters() {
     }, 4000);
 }
 
+function isGenuineChatName(name?: any, id?: string): boolean {
+    if (!name) return false;
+    const raw = typeof name === "string" ? name : (name as any)?.text || (name as any)?.name;
+    if (!raw) return false;
+    const str = String(raw).trim();
+    if (!str) return false;
+    if (id && str.toLowerCase() === id.toLowerCase()) return false;
+    if (str.endsWith("@newsletter") || str.endsWith("@g.us") || str.endsWith("@s.whatsapp.net")) return false;
+    if (/^\d{15,}$/.test(str)) return false;
+    return true;
+}
+
+function extractChatNameString(name?: any): string | undefined {
+    if (!name) return undefined;
+    const raw = typeof name === "string" ? name : (name as any)?.text || (name as any)?.name;
+    if (!raw) return undefined;
+    const str = String(raw).trim();
+    return str || undefined;
+}
+
 function registerKnownNewsletter(id: string, name?: string, count?: number) {
     if (!id) return;
     let cleanId = String(id).trim();
@@ -336,7 +356,15 @@ function registerKnownNewsletter(id: string, name?: string, count?: number) {
     if (!cleanId.endsWith("@newsletter")) return;
 
     const existing = knownNewslettersMap.get(cleanId);
-    const validName = (name && name.trim() && name.trim() !== cleanId) ? name.trim() : (existing?.name || cleanId);
+    const candidateName = extractChatNameString(name);
+
+    let validName = cleanId;
+    if (isGenuineChatName(candidateName, cleanId)) {
+        validName = candidateName!;
+    } else if (existing && isGenuineChatName(existing.name, cleanId)) {
+        validName = existing.name;
+    }
+
     const validCount = typeof count === "number" && count > 0 ? count : existing?.subscribersCount;
 
     knownNewslettersMap.set(cleanId, {
@@ -1365,6 +1393,11 @@ app.post("/getGroups", async (req, res) => {
 
 app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
     try {
+        const destinationNamesInput: Record<string, string> =
+            req.body.destinationNames && typeof req.body.destinationNames === "object"
+                ? req.body.destinationNames
+                : {};
+
         let requestedDestinations: string[] = Array.isArray(req.body.destinations)
             ? req.body.destinations.map((d: any) => String(d).trim()).filter(Boolean)
             : [];
@@ -1450,7 +1483,8 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
                             for (const nl of res) {
                                 const id = nl?.id || nl?.jid;
                                 if (id) {
-                                    const name = nl?.thread_metadata?.name?.text || nl?.name || nl?.thread_metadata?.name;
+                                    const rawName = nl?.thread_metadata?.name?.text || nl?.thread_metadata?.name || nl?.name;
+                                    const candidateName = extractChatNameString(rawName);
                                     const count = parseInt(nl?.thread_metadata?.subscribers_count || nl?.subscribers || "0", 10);
                                     const viewerRole =
                                         nl?.viewer_metadata?.role ||
@@ -1464,9 +1498,10 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
                                         role = rUpper;
                                         isAdmin = rUpper === "ADMIN" || rUpper === "OWNER";
                                     }
-                                    newsletters.set(id, { role, isAdmin, name: name ? String(name) : undefined });
-                                    if (name) {
-                                        registerKnownNewsletter(id, String(name), count || undefined);
+                                    const genuineName = isGenuineChatName(candidateName, id) ? candidateName : undefined;
+                                    newsletters.set(id, { role, isAdmin, name: genuineName });
+                                    if (genuineName) {
+                                        registerKnownNewsletter(id, genuineName, count || undefined);
                                     }
                                 }
                             }
@@ -1500,7 +1535,9 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
                                     role = participant.admin === "superadmin" ? "OWNER" : "ADMIN";
                                 }
                             }
-                            groups.set(gid, { role, isAdmin, name: meta?.subject });
+                            const rawSubj = extractChatNameString(meta?.subject);
+                            const genuineSubj = isGenuineChatName(rawSubj, gid) ? rawSubj : undefined;
+                            groups.set(gid, { role, isAdmin, name: genuineSubj });
                         }
                     }
                 } catch (grpErr: any) {
@@ -1563,22 +1600,87 @@ app.post(["/audit-admins", "/check-permissions"], async (req, res) => {
         for (const jid of uniqueDestinations) {
             const isNewsletter = jid.endsWith("@newsletter");
             const isGroup = jid.endsWith("@g.us");
-            let destName = knownNewslettersMap.get(jid)?.name || jid;
+            let destName = "";
+            const knName = knownNewslettersMap.get(jid)?.name;
+            if (isGenuineChatName(knName, jid)) {
+                destName = knName!;
+            }
 
             // Resolve name from account caches if not in disk cache
-            if (destName === jid) {
+            if (!isGenuineChatName(destName, jid)) {
                 for (const accIndex of accountIndices) {
                     const nlObj = accIndex.newsletters.get(jid);
-                    if (nlObj?.name) {
-                        destName = nlObj.name;
+                    if (isGenuineChatName(nlObj?.name, jid)) {
+                        destName = nlObj!.name!;
                         break;
                     }
                     const grpObj = accIndex.groups.get(jid);
-                    if (grpObj?.name) {
-                        destName = grpObj.name;
+                    if (isGenuineChatName(grpObj?.name, jid)) {
+                        destName = grpObj!.name!;
                         break;
                     }
                 }
+            }
+
+            // Check passed destinationNamesInput from Telegram DB
+            if (!isGenuineChatName(destName, jid)) {
+                const passed =
+                    destinationNamesInput[jid] ||
+                    destinationNamesInput[jid.toLowerCase()] ||
+                    destinationNamesInput[jid.trim()] ||
+                    destinationNamesInput[`<${jid}>`];
+                if (isGenuineChatName(passed, jid)) {
+                    destName = String(passed).trim();
+                }
+            }
+
+            // Actively resolve via ready socket if still missing
+            if (!isGenuineChatName(destName, jid)) {
+                for (const acc of readyAccounts) {
+                    const sock = sessions[acc.id]?.sock;
+                    if (!sock) continue;
+                    try {
+                        if (isNewsletter && typeof (sock as any).newsletterMetadata === "function") {
+                            const meta = await Promise.race([
+                                (sock as any).newsletterMetadata("jid", jid),
+                                new Promise<any>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500)),
+                            ]);
+                            const rawMetaName = meta?.name || (meta as any)?.thread_metadata?.name?.text || (meta as any)?.thread_metadata?.name;
+                            const candName = extractChatNameString(rawMetaName);
+                            if (isGenuineChatName(candName, jid)) {
+                                destName = candName!;
+                                registerKnownNewsletter(jid, destName, meta?.subscribers);
+                                break;
+                            }
+                        } else if (isGroup && typeof sock.groupMetadata === "function") {
+                            const gmeta = await Promise.race([
+                                sock.groupMetadata(jid),
+                                new Promise<any>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2500)),
+                            ]);
+                            const candName = extractChatNameString(gmeta?.subject);
+                            if (isGenuineChatName(candName, jid)) {
+                                destName = candName!;
+                                break;
+                            }
+                        }
+                    } catch (_) {}
+                }
+            }
+
+            // Final fallback to destinationNamesInput if socket didn't find it
+            if (!isGenuineChatName(destName, jid)) {
+                const passed =
+                    destinationNamesInput[jid] ||
+                    destinationNamesInput[jid.toLowerCase()] ||
+                    destinationNamesInput[jid.trim()] ||
+                    destinationNamesInput[`<${jid}>`];
+                if (isGenuineChatName(passed, jid)) {
+                    destName = String(passed).trim();
+                }
+            }
+
+            if (!destName) {
+                destName = jid;
             }
 
             const accountChecks: Array<{
