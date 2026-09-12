@@ -147,7 +147,7 @@ def generate_stale_channels_digest(stale_channels: list[dict], threshold_hours: 
                     and rname != clean_g
                     and not rname.endswith("@newsletter")
                     and not rname.endswith("@g.us")
-                    and not rname.isdigit()
+                    and not rname.lstrip("-").isdigit()
                 )
                 if is_genuine:
                     wa_parts.append(f"<b>{html.escape(rname)}</b> (<code>{html.escape(clean_g)}</code>)")

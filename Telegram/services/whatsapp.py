@@ -335,7 +335,13 @@ def resolve_group_name(group_id: str) -> str:
         from database import get_destination_names_map
         dmap = get_destination_names_map()
         cand = dmap.get(clean_gid) or dmap.get(f"<{clean_gid}>")
-        if cand and cand != clean_gid and not cand.endswith("@newsletter") and not cand.endswith("@g.us") and not cand.isdigit():
+        if (
+            cand
+            and cand != clean_gid
+            and not cand.endswith("@newsletter")
+            and not cand.endswith("@g.us")
+            and not cand.lstrip("-").isdigit()
+        ):
             return cand
     except Exception:
         pass
