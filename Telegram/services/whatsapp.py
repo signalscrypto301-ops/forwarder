@@ -280,6 +280,17 @@ async def fetch_whatsapp_chats(search_query: str = "") -> list[dict]:
                 cache["chats"] = chats
                 WHATSAPP_CHATS_CACHE["timestamp"] = now
                 WHATSAPP_CHATS_CACHE["chats"] = chats
+
+                # Persist genuine names to SQLite destination_titles
+                try:
+                    from database import update_destination_title
+                    for c in chats:
+                        cid = c.get("id")
+                        cname = c.get("name")
+                        if cid and cname and cname != cid and not cname.endswith("@newsletter") and not cname.endswith("@g.us"):
+                            update_destination_title(cid, cname)
+                except Exception:
+                    pass
             else:
                 logger.warning(f"Failed to fetch WhatsApp groups: {res_data}")
                 chats = cache.get("chats") or []
@@ -295,17 +306,30 @@ async def fetch_whatsapp_chats(search_query: str = "") -> list[dict]:
 
 def resolve_group_name(group_id: str) -> str:
     """
-    Resolves human-readable WhatsApp group/newsletter name from chat cache.
+    Resolves human-readable WhatsApp group/newsletter name from chat cache or database.
     Falls back to group_id if not found.
     """
     if not group_id:
         return ""
+    clean_gid = str(group_id).strip("<>\"' \t\r\n")
     bot_mod = _get_bot_module()
     cache = getattr(bot_mod, "WHATSAPP_CHATS_CACHE", WHATSAPP_CHATS_CACHE) if bot_mod else WHATSAPP_CHATS_CACHE
     chats = cache.get("chats") or []
     for c in chats:
-        if c.get("id") == group_id and c.get("name"):
-            return c.get("name")
+        cid = str(c.get("id") or "").strip("<>\"' \t\r\n")
+        cname = c.get("name")
+        if cid == clean_gid and cname and cname != cid and not cname.endswith("@newsletter") and not cname.endswith("@g.us"):
+            return cname
+
+    # Check persistent database cache
+    try:
+        from database import get_destination_title
+        db_title = get_destination_title(clean_gid)
+        if db_title:
+            return db_title
+    except Exception:
+        pass
+
     return group_id
 
 
@@ -360,8 +384,18 @@ async def sync_database_newsletters_to_whatsapp():
                 if g and ("@newsletter" in g or "@g.us" in g or len(g) > 15):
                     all_jids.add(g)
         if all_jids:
+            dest_names = {}
+            try:
+                from database import get_destination_names_map
+                dest_names = await asyncio.to_thread(get_destination_names_map)
+            except Exception:
+                pass
             logger.info(f"Syncing {len(all_jids)} database destinations to WhatsApp service...")
-            await post_fn("registerNewsletters", {"newsletters": list(all_jids)}, timeout_sec=15)
+            await post_fn(
+                "registerNewsletters",
+                {"newsletters": list(all_jids), "destinationNames": dest_names},
+                timeout_sec=15,
+            )
     except Exception as e:
         logger.debug(f"sync_database_newsletters_to_whatsapp notice: {e}")
 

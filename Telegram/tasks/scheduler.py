@@ -91,11 +91,14 @@ def generate_stale_channels_digest(stale_channels: list[dict], threshold_hours: 
     ⚠️ Stale Channel Alert: 3 channels have had no new posts in 72 hours.
     ━━━━━━━━━━━━━━━━━━━━━━
     The following monitored channels have had zero activity for > 72h:
-    • <code>-1001234567890</code> — Inactive for 78h (2 groups)
+    • <code>-1001234567890</code> (Bitcoin Signals) — Inactive for 78h (2 groups)
+      └ 📢 WA: <b>Crypto VIP</b> (<code>120363001@newsletter</code>), <b>Forex VIP</b> (<code>120363002@newsletter</code>)
     • <code>-1009876543210</code> — Inactive for 94h (1 group) [PAUSED]
+      └ 📢 WA: <b>Trading Alerts</b> (<code>120363003@newsletter</code>)
     ━━━━━━━━━━━━━━━━━━━━━━
     💡 Check if bot permissions were revoked or if the source is abandoned.
     """
+    import html
     count = len(stale_channels)
     channel_word = "channel" if count == 1 else "channels"
     has_have = "has" if count == 1 else "have"
@@ -112,11 +115,52 @@ def generate_stale_channels_digest(stale_channels: list[dict], threshold_hours: 
     lines.append(f"The following monitored channels have had zero activity for &gt; {threshold_hours}h:")
     for item in stale_channels[:25]:
         cid = item.get("channel_id", "Unknown")
+        title = item.get("title")
         hrs = item.get("hours_inactive", threshold_hours)
-        groups_count = item.get("groups_count", 0)
+        groups = item.get("groups")
+        if groups is None:
+            try:
+                from database import get_groups_for_channel
+                groups = get_groups_for_channel(cid)
+            except Exception:
+                groups = []
+
+        groups_count = item.get("groups_count", len(groups) if groups else 0)
         paused_tag = " <b>[PAUSED]</b>" if item.get("is_paused") else ""
         g_label = f"({groups_count} groups)" if groups_count != 1 else "(1 group)"
-        lines.append(f"• <code>{cid}</code> — Inactive for {hrs}h {g_label}{paused_tag}")
+
+        t_str = f" (<b>{html.escape(title)}</b>)" if title and str(title).strip() else ""
+        lines.append(f"• <code>{html.escape(cid)}</code>{t_str} — Inactive for {hrs}h {g_label}{paused_tag}")
+
+        if groups:
+            wa_parts = []
+            for g in groups:
+                clean_g = str(g).strip("<>\"' \t\r\n")
+                try:
+                    from services.whatsapp import resolve_group_name
+                    rname = resolve_group_name(clean_g)
+                except Exception:
+                    rname = clean_g
+
+                is_genuine = (
+                    bool(rname)
+                    and rname != clean_g
+                    and not rname.endswith("@newsletter")
+                    and not rname.endswith("@g.us")
+                    and not rname.isdigit()
+                )
+                if is_genuine:
+                    wa_parts.append(f"<b>{html.escape(rname)}</b> (<code>{html.escape(clean_g)}</code>)")
+                else:
+                    wa_parts.append(f"<code>{html.escape(clean_g)}</code>")
+            wa_display = ", ".join(wa_parts)
+        else:
+            if groups_count > 0:
+                wa_display = f"<i>({groups_count} destination{'s' if groups_count != 1 else ''} linked)</i>"
+            else:
+                wa_display = "<i>No WhatsApp destination linked</i>"
+
+        lines.append(f"  └ 📢 WA: {wa_display}")
 
     if count > 25:
         lines.append(f"<i>... and {count - 25} more inactive channels.</i>")
@@ -189,6 +233,13 @@ async def scheduled_stale_channel_detector_loop():
     await asyncio.sleep(60)
     while True:
         try:
+            # Pre-fetch WhatsApp chats so destination names are fresh and cached
+            try:
+                from services.whatsapp import fetch_whatsapp_chats
+                await fetch_whatsapp_chats()
+            except Exception as e:
+                logger.debug(f"Pre-digest fetch_whatsapp_chats notice: {e}")
+
             stale_channels = await asyncio.to_thread(get_stale_channels, 72)
             if stale_channels:
                 bot_mod = _get_bot_module()

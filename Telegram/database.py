@@ -111,6 +111,17 @@ def create_table():
     # Clean any accidental mock titles or malformed values from channels table
     cursor.execute("UPDATE channels SET title = NULL WHERE title LIKE '<AsyncMock%' OR title LIKE '<MagicMock%'")
 
+    # Table for cached human-readable WhatsApp destination titles
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS destination_titles (
+            destination_id TEXT PRIMARY KEY,
+            title TEXT,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
     # Table for daily delivery metrics (Optimization 4.B)
     cursor.execute(
         """
@@ -352,6 +363,70 @@ def get_channels_for_group(group_id: str) -> list[str]:
     return [clean_id(r[0]) for r in rows if clean_id(r[0])]
 
 
+def update_destination_title(destination_id: str, title: str) -> None:
+    if not destination_id or not title:
+        return
+    did = clean_destination_id(destination_id)
+    t = str(title).strip()
+    if not did or not t or t == did:
+        return
+    if t.endswith("@newsletter") or t.endswith("@g.us") or t.isdigit():
+        return
+    if t.startswith("<AsyncMock") or t.startswith("<MagicMock"):
+        return
+
+    connection = get_connection()
+    cursor = connection.cursor()
+    cursor.execute(
+        """
+        INSERT INTO destination_titles (destination_id, title, updated_at)
+        VALUES (?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(destination_id) DO UPDATE SET
+            title = excluded.title,
+            updated_at = CURRENT_TIMESTAMP
+        """,
+        (did, t),
+    )
+    connection.commit()
+    connection.close()
+
+
+def get_destination_title(destination_id: str) -> str | None:
+    if not destination_id:
+        return None
+    did = clean_destination_id(destination_id)
+    connection = get_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute(
+            "SELECT title FROM destination_titles WHERE destination_id = ?",
+            (did,),
+        )
+        row = cursor.fetchone()
+        if row and row[0]:
+            val = str(row[0]).strip()
+            if not val.startswith("<AsyncMock") and not val.startswith("<MagicMock"):
+                return val
+        return None
+    except Exception:
+        return None
+    finally:
+        connection.close()
+
+
+def get_all_destination_titles() -> dict[str, str]:
+    connection = get_connection()
+    cursor = connection.cursor()
+    try:
+        cursor.execute("SELECT destination_id, title FROM destination_titles WHERE title IS NOT NULL")
+        rows = cursor.fetchall()
+        return {r[0]: r[1] for r in rows if r[0] and r[1]}
+    except Exception:
+        return {}
+    finally:
+        connection.close()
+
+
 def get_destination_names_map() -> dict[str, str]:
     connection = get_connection()
     cursor = connection.cursor()
@@ -377,10 +452,19 @@ def get_destination_names_map() -> dict[str, str]:
             t = str(title).strip() if title and str(title).strip() else None
             val = t or (clean_id(cid) if cid else None)
             if val:
-                if clean_gid not in result:
-                    result[clean_gid] = val
-                if f"<{clean_gid}>" not in result:
-                    result[f"<{clean_gid}>"] = val
+                result[clean_gid] = val
+                result[f"<{clean_gid}>"] = val
+
+    # Override with genuine WhatsApp destination titles if available
+    try:
+        dest_titles = get_all_destination_titles()
+        for gid, dt in dest_titles.items():
+            if dt and not dt.endswith("@newsletter") and not dt.endswith("@g.us"):
+                result[gid] = dt
+                result[f"<{gid}>"] = dt
+    except Exception:
+        pass
+
     return result
 
 
@@ -1016,7 +1100,7 @@ def get_stale_channels(threshold_hours: int = 72) -> list[dict]:
     cursor = connection.cursor()
     cursor.execute(
         """
-        SELECT channel_id, last_post_at, is_paused
+        SELECT channel_id, last_post_at, is_paused, title
         FROM channels
         WHERE last_post_at IS NOT NULL AND last_post_at <= ?
         ORDER BY last_post_at ASC
@@ -1028,7 +1112,10 @@ def get_stale_channels(threshold_hours: int = 72) -> list[dict]:
 
     stale_list = []
     for r in rows:
-        cid, last_post, is_paused = r
+        cid = r[0]
+        last_post = r[1]
+        is_paused = r[2]
+        title = r[3] if len(r) > 3 and r[3] else None
         try:
             lp_dt = datetime.strptime(str(last_post).split(".")[0], "%Y-%m-%d %H:%M:%S")
             diff_hours = int((now - lp_dt).total_seconds() // 3600)
@@ -1039,9 +1126,11 @@ def get_stale_channels(threshold_hours: int = 72) -> list[dict]:
         stale_list.append(
             {
                 "channel_id": cid,
+                "title": title,
                 "last_post_at": last_post,
                 "hours_inactive": diff_hours,
                 "is_paused": bool(is_paused),
+                "groups": groups,
                 "groups_count": len(groups),
             }
         )

@@ -1031,17 +1031,34 @@ async function fetchSubscribedNewsletters(sock: any, targetId: string): Promise<
 
     // 3. For any newsletter whose name is unknown or matches JID, resolve via sock.newsletterMetadata
     for (const item of list) {
-        if ((!item.name || item.name === item.id) && typeof (sock as any).newsletterMetadata === "function") {
-            try {
-                const meta = await (sock as any).newsletterMetadata("jid", item.id);
-                if (meta) {
-                    const resolvedName = meta.name || (meta as any).thread_metadata?.name?.text;
-                    if (resolvedName) {
-                        item.name = resolvedName;
-                        registerKnownNewsletter(item.id, resolvedName, meta.subscribers);
-                    }
+        if (!item.name || item.name === item.id) {
+            const socksToTry: any[] = [];
+            if (typeof (sock as any).newsletterMetadata === "function") {
+                socksToTry.push(sock);
+            }
+            for (const s of Object.values(sessions)) {
+                if (s.isReady && s.sock && typeof (s.sock as any).newsletterMetadata === "function" && s.sock !== sock) {
+                    socksToTry.push(s.sock);
                 }
-            } catch (_) {}
+            }
+
+            for (const s of socksToTry) {
+                try {
+                    const meta = await Promise.race([
+                        (s as any).newsletterMetadata("jid", item.id),
+                        new Promise<any>((_, reject) => setTimeout(() => reject(new Error("Timeout")), 2000)),
+                    ]);
+                    if (meta) {
+                        const resolvedName = meta.name || (meta as any).thread_metadata?.name?.text || (meta as any).thread_metadata?.name;
+                        const cand = extractChatNameString(resolvedName);
+                        if (isGenuineChatName(cand, item.id)) {
+                            item.name = cand!;
+                            registerKnownNewsletter(item.id, cand, meta.subscribers);
+                            break;
+                        }
+                    }
+                } catch (_) {}
+            }
         }
     }
 
@@ -1096,11 +1113,16 @@ async function discoverChats(entry: SessionEntry, targetId: string): Promise<Cha
 }
 
 app.post("/registerNewsletters", (req, res) => {
-    const { newsletters } = req.body;
+    const { newsletters, destinationNames } = req.body;
+    const destNames = destinationNames && typeof destinationNames === "object" ? destinationNames : {};
     if (Array.isArray(newsletters)) {
         for (const item of newsletters) {
             const id = typeof item === "string" ? item : item?.id;
-            const name = typeof item === "object" ? item?.name : undefined;
+            let name = typeof item === "object" ? item?.name : undefined;
+            if (!name && id) {
+                const cleanId = String(id).trim();
+                name = destNames[cleanId] || destNames[`<${cleanId}>`];
+            }
             if (id) {
                 registerKnownNewsletter(id, name);
             }

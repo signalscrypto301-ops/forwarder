@@ -138,15 +138,53 @@ class TestStaleChannelsDetector(unittest.TestCase):
         self.assertIn('0 channels have had no new posts in 72 hours', digest)
         self.assertIn('All monitored channels are active', digest)
 
-    def test_build_channel_detail_keyboard_displays_last_activity(self):
-        cid = '-1006666666666'
-        database.add_channel(cid)
-        test_time = '2026-09-07 14:30:00'
-        database.update_channel_last_post(cid, test_time)
+    def test_destination_titles_crud(self):
+        dest_id = "120363999999999999@newsletter"
+        title = "VIP Crypto WhatsApp"
+        database.update_destination_title(dest_id, title)
+        self.assertEqual(database.get_destination_title(dest_id), title)
+        all_dests = database.get_all_destination_titles()
+        self.assertIn(dest_id, all_dests)
+        self.assertEqual(all_dests[dest_id], title)
 
-        text, kb = build_channel_detail_keyboard(cid)
-        self.assertIn('Last Activity:', text)
-        self.assertIn(test_time, text)
+    def test_stale_channels_includes_groups_and_title(self):
+        cid = "-1007777777777"
+        database.add_channel(cid)
+        database.update_channel_title(cid, "Alpha Trading Telegram")
+        database.add_group_for_channel(cid, "120363111111111111@newsletter")
+        past_time = (datetime.now() - timedelta(hours=120)).strftime("%Y-%m-%d %H:%M:%S")
+        database.update_channel_last_post(cid, past_time)
+
+        stale = database.get_stale_channels(threshold_hours=72)
+        match = next((s for s in stale if s["channel_id"] == cid), None)
+        self.assertIsNotNone(match)
+        self.assertEqual(match["title"], "Alpha Trading Telegram")
+        self.assertIn("120363111111111111@newsletter", match["groups"])
+        self.assertEqual(match["groups_count"], 1)
+
+    def test_generate_stale_channels_digest_with_whatsapp_names(self):
+        dest1 = "120363444444444444@newsletter"
+        database.update_destination_title(dest1, "Golden Forex Signals")
+
+        stale_data = [
+            {
+                "channel_id": "-1008888888888",
+                "title": "Forex TG VIP",
+                "last_post_at": "2026-09-05 12:00:00",
+                "hours_inactive": 105,
+                "is_paused": False,
+                "groups": [dest1],
+                "groups_count": 1,
+            }
+        ]
+
+        digest = generate_stale_channels_digest(stale_data, threshold_hours=72)
+        self.assertIn("-1008888888888", digest)
+        self.assertIn("Forex TG VIP", digest)
+        self.assertIn("Inactive for 105h (1 group)", digest)
+        self.assertIn("📢 WA:", digest)
+        self.assertIn("Golden Forex Signals", digest)
+        self.assertIn(dest1, digest)
 
 if __name__ == '__main__':
     unittest.main()

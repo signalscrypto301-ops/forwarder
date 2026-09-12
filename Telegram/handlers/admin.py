@@ -677,6 +677,19 @@ async def stale_channels_command(message: Message):
         if 1 <= val <= 8760:
             threshold = val
 
+    # Pre-fetch WhatsApp chat names and resolve any missing Telegram channel titles
+    try:
+        bot_instance = getattr(bot_mod, "bot", None) or getattr(message, "bot", None)
+        await _resolve_missing_channel_titles(bot_instance)
+    except Exception:
+        pass
+
+    try:
+        from services.whatsapp import fetch_whatsapp_chats
+        await fetch_whatsapp_chats()
+    except Exception:
+        pass
+
     stale = await asyncio.to_thread(get_stale_channels, threshold)
     if not stale:
         await message.reply(
